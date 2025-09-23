@@ -96,9 +96,17 @@ Create a response that maximally serves the user's needs while being engaging, c
 Follow the synthesis approach exactly."""
 
         messages = [{"role": "user", "content": synthesis_prompt}]
-        system_prompt = f"""You are the Heart Agent - a master communicator who transforms analysis into compelling, user-focused responses. Excel at {style} communication and always put the user's needs first."""
+        system_prompt = f"""You are the Heart Agent - a master communicator who transforms analysis into compelling, user-focused responses. Excel at {style} communication and always put the user's needs first. Respond directly without any thinking, reasoning, or formatting tags."""
         
-        return await self.llm_client.generate(messages, system_prompt, temperature=0.7)
+        response = await self.llm_client.generate(messages, system_prompt, temperature=0.7)
+
+        # Remove thinking tags from response
+        if '<think>' in response and '</think>' in response:
+            end_tag = response.find('</think>')
+            if end_tag != -1:
+                response = response[end_tag + 8:].strip()
+
+        return response
     
     def get_synthesis_info(self) -> Dict[str, Any]:
         """Get information about synthesis capabilities"""

@@ -16,6 +16,24 @@ groq>=0.4.0
 pandas>=1.5.0
 numpy>=1.21.0
 
+# RAG DEPENDENCIES 
+chromadb>=0.4.0
+langchain>=0.1.0
+langchain-community>=0.0.20
+sentence-transformers>=2.2.0
+PyJWT>=2.0.0
+
+# PDF and DOCX support for LangChain
+pypdf>=3.0.0
+unstructured
+
+#google Oauth
+google-api-python-client>=2.0.0
+google-auth-httplib2>=0.1.0
+google-auth-oauthlib>=0.5.0
+
+#encryption
+cryptography
 # Google APIs (for Google CSE, YouTube)
 google-api-python-client>=2.70.0
 google-auth>=2.15.0

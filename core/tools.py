@@ -11,6 +11,7 @@ import statistics
 import re
 import sqlite3
 import os
+import logging
 from typing import Dict, List, Any, Optional
 from datetime import datetime
 from abc import ABC, abstractmethod
@@ -18,6 +19,7 @@ from .exceptions import ToolExecutionError
 from .llm_client import LLMClient
 from .web_search_agent import search_perplexity
 
+logger = logging.getLogger(__name__)
 class BaseTool(ABC):
     """Base class for all tools"""
     
@@ -315,48 +317,117 @@ class WebSearchTool(BaseTool):
             await self.session.close()
 
 class RAGTool(BaseTool):
-    """Simple RAG tool for knowledge retrieval"""
-    
+    """RAG tool using user-specific ChromaDB collections"""
     def __init__(self, llm_client: LLMClient = None):
-        super().__init__(
-            "rag",
-            "Retrieve information from knowledge base"
-        )
+        super().__init__("rag", "Retrieve information from uploaded knowledge base")
         self.llm_client = llm_client
-        self.knowledge_base = {
-            "business_strategy": "Business strategy frameworks include SWOT analysis, Porter's Five Forces, and competitive positioning.",
-            "market_analysis": "Market analysis examines market size, growth trends, customer segments, and competitive landscape.",
-            "financial_analysis": "Financial analysis includes ratio analysis, cash flow analysis, and profitability assessment.",
-            "ai_trends": "Current AI trends include large language models, multimodal AI, and AI safety research."
-        }
+        logger.info("RAGTool initialized")
     
-    async def execute(self, query: str, **kwargs) -> Dict[str, Any]:
-        """Execute RAG query"""
-        
+    async def execute(self, query: str, user_id: str = None, **kwargs) -> Dict[str, Any]:
+        """Execute RAG query on user's vector database"""
         self._record_usage()
+        logger.info(f"RAG query started: user_id={user_id}, query='{query[:50]}...'")
         
         try:
-            # Simple keyword matching
-            query_lower = query.lower()
-            relevant_chunks = []
+            if not user_id:
+                logger.error("RAG query failed: User ID missing")
+                return {
+                    "success": False,
+                    "error": "User ID required for RAG queries",
+                    "query": query
+                }
             
-            for topic, content in self.knowledge_base.items():
-                if any(word in content.lower() for word in query_lower.split()):
-                    relevant_chunks.append(content)
+            from .knowledge_base import query_knowledge_base, get_user_collections
             
-            if not relevant_chunks:
-                retrieved = "No specific knowledge found for this query."
+            # Check if user has any collections
+            logger.debug(f"Checking collections for user: {user_id}")
+            collections = get_user_collections(user_id)
+            
+            if not collections:
+                logger.warning(f"RAG query: No collections found for user {user_id}")
+                return {
+                    "success": False,
+                    "error": "No knowledge base found. Please upload documents first.",
+                    "query": query
+                }
+            
+            collection_name = collections[0]
+            logger.info(f"RAG querying collection '{collection_name}' for user {user_id}")
+            
+            # Query the user's collection
+            result = query_knowledge_base(user_id, collection_name, query, n_results=5)
+            
+            if result["success"]:
+                chunks_count = len(result["results"])
+                distances = result.get("distances", [])
+                
+                # Log success with detailed metrics
+                logger.info(f"✅ RAG query SUCCESS for user {user_id}")
+                logger.info(f"   Collection: {collection_name}")
+                logger.info(f"   Retrieved chunks: {chunks_count}")
+                logger.info(f"   Query: '{query[:50]}...'")
+                
+                # Log distances for relevance analysis
+                if distances:
+                    avg_distance = sum(distances) / len(distances)
+                    min_distance = min(distances)
+                    max_distance = max(distances)
+                    
+                    logger.info(f"   Distance metrics - Min: {min_distance:.4f}, Max: {max_distance:.4f}, Avg: {avg_distance:.4f}")
+                    logger.debug(f"   All distances: {distances}")
+                    
+                    # Log quality assessment
+                    if avg_distance < 0.3:
+                        logger.info("   Quality: HIGH relevance (avg distance < 0.3)")
+                    elif avg_distance < 0.6:
+                        logger.info("   Quality: MEDIUM relevance (avg distance < 0.6)")
+                    else:
+                        logger.warning("   Quality: LOW relevance (avg distance >= 0.6)")
+                else:
+                    logger.warning("   No distance information available")
+                
+                # Log first chunk preview for debugging
+                if result["results"]:
+                    first_chunk = result["results"][0][:100] + "..." if len(result["results"][0]) > 100 else result["results"][0]
+                    logger.debug(f"   First chunk preview: '{first_chunk}'")
+                
+                return {
+                    "success": True,
+                    "retrieved": "\n\n".join(result["results"]),
+                    "chunks": result["results"],
+                    "query": query,
+                    "chunks_count": chunks_count,
+                    "collection": collection_name,
+                    "distances": distances,
+                    "avg_distance": avg_distance if distances else None
+                }
             else:
-                retrieved = "\n\n".join(relevant_chunks)
+                logger.error(f"❌ RAG query FAILED for user {user_id}")
+                logger.error(f"   Collection: {collection_name}")
+                logger.error(f"   Error: {result.get('error', 'Unknown error')}")
+                logger.error(f"   Query: '{query[:50]}...'")
+                
+                return {
+                    "success": False,
+                    "error": result["error"],
+                    "query": query
+                }
+                
+        except Exception as e:
+            logger.error(f"❌ RAG query EXCEPTION for user {user_id}")
+            logger.error(f"   Exception: {str(e)}")
+            logger.error(f"   Query: '{query[:50]}...'")
+            
+            # Log full traceback for debugging
+            import traceback
+            logger.error(f"   Traceback: {traceback.format_exc()}")
             
             return {
-                "success": True,
-                "retrieved": retrieved,
-                "chunks": relevant_chunks,
-                "query": query,
-                "chunks_count": len(relevant_chunks)
+                "success": False,
+                "error": f"RAG query failed: {str(e)}",
+                "query": query
             }
-            
+                
         except Exception as e:
             return {
                 "success": False,
@@ -367,10 +438,11 @@ class RAGTool(BaseTool):
 class ToolManager:
     """Manages all available tools"""
     
-    def __init__(self, config, llm_client: LLMClient, web_model: str = None):
+    def __init__(self, config, llm_client: LLMClient, web_model: str = None, use_premium_search: bool = False):
         self.config = config
         self.llm_client = llm_client
         self.web_model = web_model  # Store the selected web model
+        self.use_premium_search = use_premium_search
         self.tools: Dict[str, BaseTool] = {}
         self._initialize_tools()
         
@@ -379,7 +451,7 @@ class ToolManager:
     def _initialize_tools(self):
         """Initialize all configured tools"""
         
-        tool_configs = self.config.get_tool_configs(self.web_model)
+        tool_configs = self.config.get_tool_configs(self.web_model, self.use_premium_search)
         
         print(f"Tool configs: {tool_configs}")
         

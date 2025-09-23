@@ -47,6 +47,7 @@ class Config:
             'ANTHROPIC_API_KEY': 'anthropic', 
             'OPENROUTER_API_KEY': 'openrouter',
             'GROQ_API_KEY': 'groq',
+            'DEEPSEEK_API_KEY': 'deepseek'
         }
         
         for env_key, provider in provider_mappings.items():
@@ -62,10 +63,11 @@ class Config:
         """Load available models for each provider"""
         
         model_catalog = {
-            'openai': ['gpt-4o', 'gpt-4o-mini', 'gpt-4-turbo', 'gpt-3.5-turbo'],
-            'anthropic': ['claude-3-5-sonnet-20241022', 'claude-3-opus-20240229', 'claude-3-haiku-20240307'],
-            'openrouter': ['qwen/qwen3-next-80b-a3b-thinking','anthropic/claude-3.5-sonnet', 'openai/gpt-4o', 'meta-llama/llama-3.1-70b-instruct'],
-            'groq': ['llama-3.1-70b-versatile', 'llama-3.1-8b-instant', 'mixtral-8x7b-32768'],
+            'openai': ['gpt-4o-mini', 'gpt-4-turbo', 'gpt-3.5-turbo'],
+            # 'anthropic': ['claude-3-5-sonnet-20241022', 'claude-3-opus-20240229', 'claude-3-haiku-20240307'],
+            'openrouter': ['qwen/qwen3-next-80b-a3b-thinking','anthropic/claude-3.5-sonnet', 'openai/gpt-4o', 'meta-llama/llama-3.3-70b-instruct','qwen/qwen3-next-80b-a3b-instruct','deepseek/deepseek-chat-v3.1'],
+            'groq': ['llama-3.3-70b-versatile', 'llama-3.1-8b-instant', 'qwen/qwen3-32b','deepseek-r1-distill-llama-70b','openai/gpt-oss-20b'],
+            # 'deepseek': ['deepseek-chat', 'deepseek-reasoner']
         }
         
         for provider in self.available_providers:
@@ -101,6 +103,8 @@ class Config:
             base_url = "https://openrouter.ai/api/v1"
         elif provider == 'groq':
             base_url = "https://api.groq.com/openai/v1"
+        elif provider == 'deepseek':
+            base_url = "https://api.deepseek.com/v1"
         
         return LLMConfig(
             provider=provider,
@@ -111,9 +115,9 @@ class Config:
             base_url=base_url
         )
     
-    def get_tool_configs(self, web_model: str = None) -> Dict[str, Any]:
+    def get_tool_configs(self, web_model: str = None, use_premium_search: bool = False) -> Dict[str, Any]:
+
         """Get tool configurations with selected web model"""
-        
         # Default web model if none provided
         if not web_model:
             web_model = self.available_web_models[0]
@@ -133,10 +137,10 @@ class Config:
             },
             'web_search': {
                 'enabled': web_search_enabled,
-                'provider': 'perplexity',  # Default to Perplexity
-                'web_model': web_model,
+                'provider': 'perplexity' if use_premium_search else ('serper' if serper_key else 'valueserp'),
+                'web_model': web_model if use_premium_search else None,
                 'primary_key': serper_key or valueserp_key,  # For non-Perplexity providers
-                'description': f'Internet search using {web_model}',
+                'description': f'Internet search using {"Perplexity " + web_model if use_premium_search else "Serper/ValueSerp"}',
                 'model_info': {
                     'selected_model': web_model,
                     'available_models': self.available_web_models
@@ -157,7 +161,7 @@ class Config:
             }
         }
         
-        print(f"🛠️  Tool configs generated with web model: {web_model}")
+        print(f"🚀 Premium search enabled: {use_premium_search}")
         print(f"🔍 Web search enabled: {web_search_enabled}")
         
         return tools

@@ -52,7 +52,7 @@ class LLMClient:
         try:
             if self.config.provider == 'anthropic':
                 return await self._anthropic_request(messages, temp, tokens)
-            elif self.config.provider in ['openai', 'openrouter', 'groq']:
+            elif self.config.provider in ['openai', 'openrouter', 'groq', 'deepseek']:
                 return await self._openai_compatible_request(messages, temp, tokens)
             else:
                 raise Exception(f"Unsupported provider: {self.config.provider}")
@@ -128,11 +128,17 @@ class LLMClient:
         
         async with self.session.post(url, headers=headers, json=payload) as response:
             
-            if response.status != 200:
-                error_text = await response.text()
-                raise Exception(f"API error {response.status}: {error_text}")
+            response_text = await response.text()
             
-            result = await response.json()
+            if response.status != 200:
+                raise Exception(f"API error {response.status}: {response_text}")
+            
+            # Safe JSON parsing with better error handling
+            try:
+                result = json.loads(response_text)
+            except json.JSONDecodeError as e:
+                raise Exception(f"Invalid JSON from {self.config.provider}: '{response_text[:200]}...' Error: {e}")
+            
             return result["choices"][0]["message"]["content"]
     
     def get_model_info(self) -> Dict[str, str]:

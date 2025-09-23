@@ -7,8 +7,238 @@ import streamlit as st
 import asyncio
 import json
 import time
-from datetime import datetime
-from typing import Dict, Any, Optional
+import uuid
+import os
+import shutil
+import threading
+import logging
+from datetime import datetime, timezone
+from typing import Dict, Any, Optional, List
+import sys
+from core.google_drive_integration import render_multi_account_drive_picker, cleanup_multi_account_session
+
+
+
+
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s %(name)s %(levelname)s: %(message)s',
+    handlers=[
+        logging.StreamHandler(sys.stdout),
+        logging.FileHandler('error.log', encoding='utf-8', errors='replace')
+    ],
+    force=True  # Override any existing configuration
+)
+
+# Set specific loggers
+logging.getLogger('core.google_drive_integration').setLevel(logging.INFO)
+logging.getLogger('core.knowledge_base').setLevel(logging.INFO)
+
+logger = logging.getLogger(__name__)
+
+def cleanup_expired_sessions():
+    """Clean up expired sessions - REMOVES ENTIRE FOLDERS"""
+    from core.session_manager import SessionTokenManager
+    
+    sessions_dir = "sessions"
+    if not os.path.exists(sessions_dir):
+        logger.info("No sessions to clean")
+        return
+    
+    logger.info("Starting session cleanup...")
+    current_time = datetime.now(timezone.utc)
+    cleaned_count = 0
+    
+    for user_id in os.listdir(sessions_dir):
+        user_path = os.path.join(sessions_dir, user_id)
+        if not os.path.isdir(user_path):
+            continue
+        
+        user_expired = False
+        
+        for filename in os.listdir(user_path):
+            if filename.startswith('session_') and filename.endswith('.json'):
+                account_id = filename.replace('session_', '').replace('.json', '')
+                
+                try:
+                    # Create session manager to revoke tokens properly
+                    session_mgr = SessionTokenManager(user_id, account_id)
+                    
+                    # Read session directly - avoid infinite loop
+                    with open(os.path.join(user_path, filename), 'r') as f:
+                        encrypted_data = f.read()
+                    
+                    decrypted_data = session_mgr._decrypt_data(encrypted_data)
+                    if decrypted_data:
+                        session_data = json.loads(decrypted_data)
+                        expires_at = datetime.fromisoformat(session_data['expires_at'])
+                        
+                        if current_time > expires_at:
+                            # Session expired - revoke with FIXED method
+                            session_mgr.revoke_google_tokens()
+                            logger.info(f"Revoked expired session: {user_id}/{account_id}")
+                            user_expired = True
+                            break  # One expired session = remove whole user
+                        else:
+                            # Active session - keep user
+                            user_expired = False
+                            break
+                
+                except Exception as e:
+                    logger.warning(f"Error processing {user_id}/{filename}: {e}")
+                    user_expired = True
+                    break
+        
+        # Remove ENTIRE user folder
+        if user_expired:
+            try:
+                shutil.rmtree(user_path)
+                cleaned_count += 1
+                logger.info(f"Removed entire user folder: {user_id}")
+            except Exception as e:
+                logger.warning(f"Could not remove user folder {user_id}: {e}")
+    
+    logger.info(f"Cleanup completed: {cleaned_count} users removed")
+
+
+
+@st.cache_resource
+def start_background_cleanup():
+    """Start background cleanup service - CACHED to prevent multiple threads"""
+    def worker():
+        logger.info("🕐 Background worker starting, waiting 60 seconds...")
+        time.sleep(60)  # Initial delay
+        
+        while True:
+            try:
+                logger.info("🕐 Running scheduled background cleanup...")
+                cleanup_expired_sessions()
+                logger.info("🕐 Background cleanup completed, sleeping 1 hour...")
+                time.sleep(3600)  # Run every hour
+            except Exception as e:
+                logger.error(f"❌ Background cleanup error: {e}")
+                time.sleep(3600)
+    
+    thread = threading.Thread(target=worker, daemon=True)
+    thread.start()
+    logger.info("🔄 Background cleanup service started (cached)")
+    
+    return "started"  # Return something so cache works
+
+
+
+def get_user_id():
+    """Get or create user ID"""
+    if 'user_id' not in st.session_state:
+        st.session_state.user_id = str(uuid.uuid4())
+        logger.info(f"New user session: {st.session_state.user_id}")
+    return st.session_state.user_id
+
+def get_user_collections(user_id: str) -> List[str]:
+    """Get user's collections"""
+    try:
+        user_path = f"db_collection/{user_id}"
+        if os.path.exists(user_path):
+            return [d for d in os.listdir(user_path) if os.path.isdir(os.path.join(user_path, d))]
+        return []
+    except Exception as e:
+        logger.error(f"Error getting collections: {e}")
+        return []
+    
+def display_collection_name(user_id: str, namespaced_name: str) -> str:
+    """Show clean collection names to users"""
+    from core.knowledge_base import get_display_collection_name
+    return get_display_collection_name(user_id, namespaced_name)
+
+def create_collection(user_id: str, collection_name: str, files: List):
+    """Create new collection from uploaded files - ENHANCED VERSION WITH CLOUD CLEANUP"""
+    try:
+        from core.knowledge_base import kb_manager
+        from core.knowledge_base import create_knowledge_base
+        
+        # Create user directory
+        user_path = f"db_collection/{user_id}"
+        os.makedirs(user_path, exist_ok=True)
+        
+        # STEP 1: Delete ALL existing Chroma Cloud collections for this user
+        try:
+            client = kb_manager._get_chroma_client()
+            all_collections = client.list_collections()
+            user_prefix = f"{user_id}_"
+            
+            for collection in all_collections:
+                if collection.name.startswith(user_prefix):
+                    client.delete_collection(name=collection.name)
+                    logger.info(f"Deleted remote collection: {collection.name}")
+        except Exception as e:
+            logger.warning(f"Could not clean up remote collections: {e}")
+        
+        # STEP 2: Remove existing local collections 
+        for existing in os.listdir(user_path):
+            existing_path = os.path.join(user_path, existing)
+            if os.path.isdir(existing_path):
+                shutil.rmtree(existing_path)
+                logger.info(f"Removed local collection: {existing}")
+        
+        # STEP 3: Create new collection directory and save files
+        collection_path = os.path.join(user_path, collection_name)
+        os.makedirs(collection_path, exist_ok=True)
+        
+        # Save uploaded files
+        file_paths = []
+        for file in files:
+            file_path = os.path.join(collection_path, file.name)
+            with open(file_path, "wb") as f:
+                f.write(file.getvalue())
+            file_paths.append(file_path)
+        
+        logger.info(f"Saved {len(files)} files for processing")
+        
+        # STEP 4: Create vector database using your knowledge_base.py logic
+        result = create_knowledge_base(user_id, collection_name, file_paths)
+        
+        if result["success"]:
+            logger.info(f"Knowledge base created successfully: {collection_name}")
+            return True
+        else:
+            logger.error(f"Knowledge base creation failed: {result.get('error', 'Unknown error')}")
+            return False
+        
+    except Exception as e:
+        logger.error(f"Failed to create collection: {e}")
+        return False
+
+def render_rag_sidebar():
+    """Render RAG UI in sidebar - ONLY ADDITION"""
+    user_id = get_user_id()
+    collections = get_user_collections(user_id)
+    
+    st.markdown("### 📚 RAG Configuration")
+    
+    if collections:
+        collection_name = collections[0]
+        clean_name = display_collection_name(user_id, collection_name)
+        st.success(f"Active: {clean_name}")
+        
+        # Show file count
+        try:
+            metadata_path = f"db_collection/{user_id}/{collection_name}/metadata.json"
+            if os.path.exists(metadata_path):
+                with open(metadata_path, 'r') as f:
+                    metadata = json.load(f)
+                st.info(f"Files: {metadata.get('file_count', 0)}")
+        except Exception as e:
+            logger.error(f"Error reading metadata: {e}")
+            
+        if st.button("🔄 Replace Collection"):
+            st.session_state.show_upload = True
+    else:
+        st.info("No collection loaded")
+        st.warning("RAG tool disabled")
+        if st.button("📁 Create Collection"):
+            st.session_state.show_upload = True
+
+
 
 # Import core system
 try:
@@ -21,7 +251,7 @@ except ImportError as e:
     st.error(f"Core system import failed: {e}")
     st.markdown("""
     **Fix Dependencies:**
-    ```bash
+    ```
     python fix_dependencies.py
     # OR manually:
     pip install aiohttp python-dotenv streamlit requests pandas numpy
@@ -29,8 +259,10 @@ except ImportError as e:
     """)
     SYSTEM_AVAILABLE = False
 
+
 if not SYSTEM_AVAILABLE:
     st.stop()
+
 
 # Page configuration
 st.set_page_config(
@@ -39,6 +271,7 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="expanded"
 )
+
 
 @st.cache_resource
 def initialize_config():
@@ -49,7 +282,8 @@ def initialize_config():
     except Exception as e:
         return {"status": "error", "error": str(e)}
 
-async def create_agents_async(config, brain_model_config, heart_model_config, web_model_config):
+
+async def create_agents_async(config, brain_model_config, heart_model_config, web_model_config, use_premium_search=False):
     """Create Brain and Heart agents with selected models"""
     try:
         # Create LLM clients
@@ -57,7 +291,7 @@ async def create_agents_async(config, brain_model_config, heart_model_config, we
         heart_llm = LLMClient(heart_model_config)
         
         # Create tool manager with web model config
-        tool_manager = ToolManager(config, brain_llm, web_model_config)
+        tool_manager = ToolManager(config, brain_llm, web_model_config, use_premium_search)
         
         # Create agents
         brain_agent = BrainAgent(brain_llm, tool_manager)
@@ -71,6 +305,7 @@ async def create_agents_async(config, brain_model_config, heart_model_config, we
         }
     except Exception as e:
         return {"status": "error", "error": str(e)}
+
 
 def display_model_selector(config, agent_name: str, default_temp: float):
     """Display model selection interface"""
@@ -104,6 +339,7 @@ def display_model_selector(config, agent_name: str, default_temp: float):
     
     return config.create_llm_config(provider, model, temperature)
 
+
 def display_web_model_selector(config, agent_name: str):
     """Display web model selection interface"""
     
@@ -119,7 +355,8 @@ def display_web_model_selector(config, agent_name: str):
     
     return model
 
-async def process_query_real(query: str, brain_agent, heart_agent, style: str) -> Dict[str, Any]:
+
+async def process_query_real(query: str, brain_agent, heart_agent, style: str, user_id: str = None) -> Dict[str, Any]:
     """Process query through REAL Brain-Heart system - NO HARDCODING"""
     
     try:
@@ -127,7 +364,7 @@ async def process_query_real(query: str, brain_agent, heart_agent, style: str) -
         
         # Phase 1: Brain Agent Processing (REAL LLM-driven orchestration)
         st.info("🧠 Brain Agent analyzing query and selecting tools...")
-        brain_result = await brain_agent.process_query(query)
+        brain_result = await brain_agent.process_query(query, user_id=user_id)
         
         brain_time = time.time() - start_time
         
@@ -159,6 +396,7 @@ async def process_query_real(query: str, brain_agent, heart_agent, style: str) -
             "success": False,
             "error": f"System processing failed: {str(e)}"
         }
+
 
 def display_real_results(result: Dict[str, Any], query: str):
     """Display REAL results from Brain-Heart processing"""
@@ -264,8 +502,15 @@ def display_real_results(result: Dict[str, Any], query: str):
         st.markdown("**Full Heart Result:**")
         st.json(heart_result)
 
+
 def main():
     """Main Streamlit application - REAL Brain-Heart system"""
+    
+    logger.info("Application started")  
+    # Start automatic cleanup service
+    start_background_cleanup()
+    
+    logger.info("Application started with background cleanup service")
     
     # Header
     st.markdown("# 🧠❤️ Brain-Heart Deep Research System")
@@ -312,11 +557,32 @@ def main():
         # Web Agent Configuration  
         st.markdown("### 🌐 Web Search Agent")
         st.caption("Handles web search operations")
-        web_model_config = display_web_model_selector(config, "Web")
+        # Premium search toggle
+        use_premium_search = st.checkbox("🚀 Enable Premium Search (Perplexity)", value=False)
+        
+        # Show model selector only if premium enabled
+        if use_premium_search:
+            web_model_config = display_web_model_selector(config, "Web")
+        else:
+            web_model_config = None  # Will use Serper/ValueSerp
         
         st.markdown("---")
-        
-        # Communication style
+        st.markdown("### 🧪 Debug Cleanup")
+        if st.button("🧪 Manual Cleanup Test"):
+            logger.info("🧪 MANUAL TEST: Starting cleanup...")
+            cleanup_expired_sessions()
+            logger.info("🧪 MANUAL TEST: Cleanup completed")
+            st.success("Check terminal logs!")
+
+        if st.button("📂 Show Sessions"):
+            if os.path.exists("sessions"):
+                for user_dir in os.listdir("sessions"):
+                    st.write(f"👤 {user_dir}")
+                    user_path = os.path.join("sessions", user_dir)
+                    if os.path.isdir(user_path):
+                        for f in os.listdir(user_path):
+                            st.write(f"  📄 {f}")
+                # Communication style
         st.markdown("### 💬 Response Style")
         style = st.selectbox(
             "Heart Agent Communication:",
@@ -324,14 +590,176 @@ def main():
             help="How the Heart Agent presents final response"
         )
         
+        # RAG Configuration - RIGHT BELOW RESPONSE STYLE - ONLY ADDITION
+        render_rag_sidebar()
+        
+        st.markdown("---")  # ONLY ADDITION
+        
         # Tool status
         st.markdown("### 🛠️ Available Tools")
-        tool_configs = config.get_tool_configs(web_model_config)
+        tool_configs = config.get_tool_configs(web_model=web_model_config, use_premium_search=use_premium_search)
         for tool_name, tool_config in tool_configs.items():
             status = "✅" if tool_config.get("enabled", False) else "❌"
             st.markdown(f"{status} {tool_name}")
             if tool_name == "web_search" and tool_config.get("enabled"):
                 st.caption(f"   Model: {web_model_config}")
+    
+    # FILE UPLOAD INTERFACE - ONLY ADDITION  
+    if st.session_state.get('show_upload', False):
+        st.markdown("---")
+        st.markdown("## 📤 Upload Documents for RAG")
+        
+        collection_name = st.text_input("Collection Name:", value="")
+        
+        # File source tabs
+        tab1, tab2 = st.tabs(["💻 Local Files", "📁 Google Drive"])
+        
+        file_paths = None
+        
+        with tab1:
+            uploaded_files = st.file_uploader(
+                "Upload Files:",
+                type=[
+                    'txt', 'md', 'rtf', 'pdf', 'doc', 'docx', 'docm', 'dot', 'dotx', 'dotm', 'odt',
+                    'csv', 'tsv', 'json', 'xlsx', 'xls', 'xlsm', 'xlsb', 'xltx', 'xltm', 'ods',
+                    'ppt', 'pptx', 'pptm', 'potx', 'potm', 'ppsx', 'ppsm', 'odp',
+                    'mdb', 'accdb', 'html', 'htm', 'xml', 'msg', 'eml', 'epub'
+                ],
+                accept_multiple_files=True
+            )
+            
+            if uploaded_files:
+                file_paths = "local_files"  # Flag for local files
+        
+        with tab2:
+            # Multi-account Google Drive picker with NO premature download
+            selected_files = render_multi_account_drive_picker(get_user_id(), download_files=False)
+            
+            if selected_files and len(selected_files) > 0:
+                file_paths = selected_files  # File metadata, not actual files
+                
+                # Show selected files summary (NO download yet)
+                st.success(f"✅ Selected {len(selected_files)} files from Google Drive")
+                
+                # Show file details
+                for file_info in selected_files:
+                    st.write(f"📄 {file_info['name']} ({file_info.get('account_alias', 'Unknown account')})")
+                
+                # Group files by account using metadata
+                account_summary = {}
+                for file_info in selected_files:
+                    account_id = file_info.get('account_id', 'unknown')
+                    account_summary[account_id] = account_summary.get(account_id, 0) + 1
+                
+                if len(account_summary) > 1:
+                    st.info(f"📊 Files from {len(account_summary)} accounts: " + 
+                        ", ".join([f"{acc}: {count}" for acc, count in account_summary.items()]))
+            else:
+                file_paths = None
+
+        
+        # Create collection button
+        col1, col2 = st.columns(2)
+        with col1:
+            if st.button("✅ Create Collection", key="create_collection"):
+                if not collection_name.strip():
+                    st.error("❌ Please enter collection name")
+                elif not file_paths:
+                    st.error("❌ Please select files")
+                else:
+                    with st.spinner("🔄 Creating knowledge base..."):
+                        # Handle local vs Drive files
+                        if file_paths == "local_files":
+                            # Local files - existing logic
+                            if create_collection(get_user_id(), collection_name, uploaded_files):
+                                st.success("✅ Collection created from local files!")
+                                st.session_state.show_upload = False
+                                st.rerun()
+                            else:
+                                st.error("❌ Failed to create collection")
+                        else:
+                            # Google Drive files - DOWNLOAD ONLY WHEN CREATING
+                            downloaded_files = []
+                            success = False
+                            
+                            try:
+                                # STEP 1: Download selected files NOW
+                                st.info("📥 Downloading selected files...")
+                                from core.google_drive_integration import MultiAccountGoogleDriveManager
+                                drive_manager = MultiAccountGoogleDriveManager(get_user_id())
+                                
+                                downloaded_files = drive_manager.download_files_with_conflict_resolution(file_paths)
+                                
+                                if not downloaded_files:
+                                    st.error("❌ Failed to download files")
+                                else:
+                                    st.success(f"✅ Downloaded {len(downloaded_files)} files")
+                                    
+                                    # STEP 2: Create knowledge base
+                                    st.info("🔄 Creating knowledge base...")
+                                    from core.knowledge_base import create_knowledge_base
+                                    
+                                    # Detect if multi-account
+                                    has_multiple_accounts = len(set(f.get('account_id') for f in file_paths)) > 1
+                                    
+                                    if has_multiple_accounts:
+                                        result = create_knowledge_base(
+                                            get_user_id(), 
+                                            collection_name, 
+                                            downloaded_files, 
+                                            account_info="multi_account"
+                                        )
+                                    else:
+                                        result = create_knowledge_base(get_user_id(), collection_name, downloaded_files)
+                                    
+                                    if result["success"]:
+                                        st.success("✅ Collection created from Google Drive!")
+                                        success = True
+                                    else:
+                                        st.error(f"❌ Failed to create collection: {result.get('error')}")
+                            
+                            except Exception as e:
+                                st.error(f"❌ Error during collection creation: {e}")
+                                logger.error(f"Collection creation error: {e}")
+                            
+                            finally:
+                                # STEP 3: ALWAYS CLEANUP
+                                st.info("🧹 Cleaning up...")
+                                try:
+                                    # Clean up downloaded files
+                                    for file_path in downloaded_files:
+                                        if os.path.exists(file_path):
+                                            os.remove(file_path)
+                                    
+                                    # Revoke Google sessions for security
+                                    cleanup_multi_account_session(get_user_id(), keep_connection=True)
+                                    
+                                except Exception as cleanup_error:
+                                    logger.error(f"Cleanup error: {cleanup_error}")
+                                
+                                # If successful, close upload UI
+                                if success:
+                                    st.session_state.show_upload = False
+                                    st.rerun()
+
+        
+        with col2:
+            if st.button("❌ Cancel", key="upload_cancel"):
+                # AUTOMATIC REVOKE FOR SECURITY (Fixed)
+                from core.google_drive_integration import MultiAccountGoogleDriveManager
+                drive_manager = MultiAccountGoogleDriveManager(get_user_id())
+                
+                # Always revoke for security when cancelling
+                with st.spinner("🔒 Cleaning up and revoking access..."):
+                    revoked = drive_manager.security_disconnect_all()
+                    if revoked > 0:
+                        st.success(f"✅ Revoked {revoked} Google accounts for security")
+                    else:
+                        # Fallback cleanup if no accounts to revoke
+                        cleanup_multi_account_session(get_user_id(), keep_connection=False)
+                
+                st.session_state.show_upload = False
+                st.rerun()
     
     # Main interface
     st.markdown("## 🎯 Research Query")
@@ -362,16 +790,18 @@ def main():
         with col2:
             st.info(f"❤️ Heart: {heart_model_config.provider}/{heart_model_config.model} (T={heart_model_config.temperature})")
         with col3:
-            st.info(f"🌐 Web: {web_model_config}")
+            search_type = f"Premium: {web_model_config}" if use_premium_search else "Standard: Serper/ValueSerp"
+            st.info(f"🌐 Web: {search_type}")
         
         # Create agents and process
         with st.spinner("Creating agents and processing query..."):
             try:
                 # Run async agent creation and processing
-                agents_result = asyncio.run(create_agents_async(config, brain_model_config, heart_model_config, web_model_config))
+                agents_result = asyncio.run(create_agents_async(config, brain_model_config, heart_model_config, web_model_config, use_premium_search))
                 
                 if agents_result["status"] == "error":
                     st.error(f"❌ Agent creation failed: {agents_result['error']}")
+                    logger.error(f"Agent creation failed: {agents_result['error']}")  # ONLY ADDITION
                     if show_debug:
                         st.json(agents_result)
                 else:
@@ -380,7 +810,8 @@ def main():
                         query, 
                         agents_result["brain_agent"], 
                         agents_result["heart_agent"], 
-                        style
+                        style,
+                        user_id=get_user_id()
                     ))
                     
                     # Display real results
@@ -388,6 +819,7 @@ def main():
                     
             except Exception as e:
                 st.error(f"❌ Processing failed: {str(e)}")
+                logger.error(f"Processing failed: {str(e)}")  # ONLY ADDITION
                 if show_debug:
                     import traceback
                     st.code(traceback.format_exc())
@@ -403,6 +835,7 @@ def main():
         🧠 Pure LLM Orchestration • ❤️ Dynamic Synthesis • 🛠️ Real Tool Execution
     </div>
     """, unsafe_allow_html=True)
+
 
 if __name__ == "__main__":
     main()
