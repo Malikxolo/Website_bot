@@ -53,3 +53,4 @@ matplotlib>=3.6.0
 # Development (optional)
 pytest>=7.0.0
 black>=22.0.0
+python-json-logger

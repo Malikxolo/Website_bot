@@ -15,25 +15,83 @@ import logging
 from datetime import datetime, timezone
 from typing import Dict, Any, Optional, List
 import sys
+import logging.config
+from chroma_log_handler import ChromaLogHandler
+from dotenv import load_dotenv
 from core.google_drive_integration import render_multi_account_drive_picker, cleanup_multi_account_session
 
+load_dotenv()
 
+# Initialize user_id FIRST (before logging)
+if 'user_id' not in st.session_state:
+    st.session_state.user_id = str(uuid.uuid4())
 
+# Optimized logging configuration
+LOGGING_CONFIG = {
+    'version': 1,
+    'disable_existing_loggers': False,
+    'formatters': {
+        'console': {
+            'format': '[%(asctime)s] %(name)-20s %(levelname)-8s | %(funcName)s:%(lineno)d | %(message)s',
+            'datefmt': '%Y-%m-%d %H:%M:%S'
+        }
+    },
+    'handlers': {
+        'console': {
+            'class': 'logging.StreamHandler',
+            'level': 'INFO',
+            'formatter': 'console',
+            'stream': 'ext://sys.stdout'
+        },
+        'chroma': {
+            'class': 'chroma_log_handler.ChromaLogHandler',
+            'level': 'INFO',  # ← Change from WARNING to INFO
+            'api_key': os.getenv('CHROMA_LOGS_API_KEY'),
+            'tenant': os.getenv('CHROMA_LOGS_TENANT'), 
+            'database': os.getenv('CHROMA_LOGS_DATABASE')
+        }
+    },
+    'loggers': {
+        'core.google_drive_integration': {
+            'level': 'INFO',  # ← Change from WARNING to INFO
+            'handlers': ['console', 'chroma'],  # ← Add chroma handler
+            'propagate': False
+        },
+        'core.knowledge_base': {
+            'level': 'INFO',
+            'handlers': ['console', 'chroma'],
+            'propagate': False
+        },
+        'chromadb.telemetry': {
+            'level': 'CRITICAL',
+            'handlers': [],
+            'propagate': False
+        },
+        'httpx': {
+            'level': 'WARNING',
+            'handlers': ['console'],
+            'propagate': False
+        },
+        # ADD THESE TO SUPPRESS ASYNCIO ERRORS
+        'asyncio': {
+            'level': 'CRITICAL',
+            'handlers': [],
+            'propagate': False
+        },
+        'aiohttp': {
+            'level': 'CRITICAL', 
+            'handlers': [],
+            'propagate': False
+        }
+    },
+    'root': {
+        'level': 'INFO',
+        'handlers': ['console', 'chroma']
+    }
+}
 
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s %(name)s %(levelname)s: %(message)s',
-    handlers=[
-        logging.StreamHandler(sys.stdout),
-        logging.FileHandler('error.log', encoding='utf-8', errors='replace')
-    ],
-    force=True  # Override any existing configuration
-)
-
-# Set specific loggers
-logging.getLogger('core.google_drive_integration').setLevel(logging.INFO)
-logging.getLogger('core.knowledge_base').setLevel(logging.INFO)
-
+# Apply logging configuration
+logging.config.dictConfig(LOGGING_CONFIG)
 logger = logging.getLogger(__name__)
 
 def cleanup_expired_sessions():
@@ -54,51 +112,82 @@ def cleanup_expired_sessions():
         if not os.path.isdir(user_path):
             continue
         
-        user_expired = False
+        logger.info(f"🔍 Checking user: {user_id}")
         
-        for filename in os.listdir(user_path):
-            if filename.startswith('session_') and filename.endswith('.json'):
-                account_id = filename.replace('session_', '').replace('.json', '')
-                
-                try:
-                    # Create session manager to revoke tokens properly
-                    session_mgr = SessionTokenManager(user_id, account_id)
-                    
-                    # Read session directly - avoid infinite loop
-                    with open(os.path.join(user_path, filename), 'r') as f:
-                        encrypted_data = f.read()
-                    
-                    decrypted_data = session_mgr._decrypt_data(encrypted_data)
-                    if decrypted_data:
-                        session_data = json.loads(decrypted_data)
-                        expires_at = datetime.fromisoformat(session_data['expires_at'])
-                        
-                        if current_time > expires_at:
-                            # Session expired - revoke with FIXED method
-                            session_mgr.revoke_google_tokens()
-                            logger.info(f"Revoked expired session: {user_id}/{account_id}")
-                            user_expired = True
-                            break  # One expired session = remove whole user
-                        else:
-                            # Active session - keep user
-                            user_expired = False
-                            break
-                
-                except Exception as e:
-                    logger.warning(f"Error processing {user_id}/{filename}: {e}")
-                    user_expired = True
-                    break
+        # Get all session files
+        session_files = [f for f in os.listdir(user_path) if f.startswith('session_') and f.endswith('.json')]
         
-        # Remove ENTIRE user folder
-        if user_expired:
+        if not session_files:
+            # Empty folder - remove it
+            logger.info(f"🗑️ Empty user folder found: {user_id}")
             try:
                 shutil.rmtree(user_path)
                 cleaned_count += 1
-                logger.info(f"Removed entire user folder: {user_id}")
+                logger.info(f"✅ Removed empty user folder: {user_id}")
             except Exception as e:
-                logger.warning(f"Could not remove user folder {user_id}: {e}")
+                logger.error(f"❌ Failed to remove empty folder {user_id}: {e}")
+            continue
+        
+        # Check each session file
+        user_expired = False
+        for filename in session_files:
+            account_id = filename.replace('session_', '').replace('.json', '')
+            session_file = os.path.join(user_path, filename)
+            
+            logger.info(f"🔍 Checking session: {user_id}/{account_id}")
+            
+            try:
+                # Read session file in binary mode
+                with open(session_file, 'rb') as f:
+                    encrypted_data = f.read()
+                
+                # Try to decrypt (TTL check)
+                session_mgr = SessionTokenManager(user_id, account_id)
+                decrypted_data = session_mgr._decrypt_data(encrypted_data)
+                
+                if not decrypted_data:
+                    # TTL expired - mark for deletion
+                    logger.info(f"🗑️ Session TTL expired: {user_id}/{account_id}")
+                    user_expired = True
+                    break
+                else:
+                    # Session still valid - keep user
+                    logger.info(f"✅ Session valid: {user_id}/{account_id}")
+                    user_expired = False
+                    break
+            
+            except Exception as e:
+                logger.info(f"🗑️ Session read error (expired): {user_id}/{account_id} - {e}")
+                user_expired = True
+                break
+        
+        # Delete user folder if expired
+        if user_expired:
+            try:
+                logger.info(f"🗑️ Removing expired user folder: {user_id}")
+                
+                # Try to revoke tokens first
+                try:
+                    for filename in session_files:
+                        account_id = filename.replace('session_', '').replace('.json', '')
+                        session_mgr = SessionTokenManager(user_id, account_id)
+                        session_mgr.revoke_google_tokens()
+                        logger.info(f"🔒 Revoked tokens: {user_id}/{account_id}")
+                except Exception as revoke_error:
+                    logger.warning(f"Token revocation failed (continuing): {revoke_error}")
+                
+                # Delete the folder
+                shutil.rmtree(user_path)
+                cleaned_count += 1
+                logger.info(f"✅ Deleted expired user folder: {user_id}")
+                
+            except Exception as delete_error:
+                logger.error(f"❌ Failed to delete {user_id}: {delete_error}")
+        else:
+            logger.info(f"✅ Keeping user: {user_id}")
     
     logger.info(f"Cleanup completed: {cleaned_count} users removed")
+
 
 
 
@@ -506,11 +595,10 @@ def display_real_results(result: Dict[str, Any], query: str):
 def main():
     """Main Streamlit application - REAL Brain-Heart system"""
     
-    logger.info("Application started")  
-    # Start automatic cleanup service
-    start_background_cleanup()
-    
-    logger.info("Application started with background cleanup service")
+    if 'app_initialized' not in st.session_state:
+        start_background_cleanup()
+        st.session_state.app_initialized = True
+
     
     # Header
     st.markdown("# 🧠❤️ Brain-Heart Deep Research System")

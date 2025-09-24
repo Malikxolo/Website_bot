@@ -42,7 +42,8 @@ class MultiAccountGoogleDriveManager:
         self.base_temp_path = "temp_drive_files"
         self.account_manager = MultiAccountManager(user_id)
         
-        logger.info(f"🚀 MultiAccountGoogleDriveManager initialized for user: {user_id}")
+        logger.debug(f"🚀 MultiAccountGoogleDriveManager initialized for user: {user_id}")
+
     
     def is_available(self) -> bool:
         """Check if Google Drive integration is available"""
