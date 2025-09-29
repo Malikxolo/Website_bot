@@ -14,8 +14,9 @@ logger = logging.getLogger(__name__)
 class OptimizedAgent:
     """Single-pass agent that minimizes LLM calls while maintaining all functionality"""
     
-    def __init__(self, llm_client, tool_manager):
-        self.llm_client = llm_client
+    def __init__(self, brain_llm, heart_llm, tool_manager):
+        self.brain_llm = brain_llm
+        self.heart_llm = heart_llm
         self.tool_manager = tool_manager
         self.available_tools = tool_manager.get_available_tools()
         logger.info(f"OptimizedAgent initialized with tools: {self.available_tools}")
@@ -29,6 +30,8 @@ class OptimizedAgent:
         try:
             # STEP 1: Single comprehensive analysis (combines semantic + business + planning)
             analysis_start = datetime.now()
+            with open("debug_analysis_prompt.json", "w") as f:
+                f.write(json.dumps(chat_history))
             analysis = await self._comprehensive_analysis(query, chat_history)
             analysis_time = (datetime.now() - analysis_start).total_seconds()
             logger.info(f"⏱️ Analysis completed in {analysis_time:.2f}s")
@@ -45,6 +48,7 @@ class OptimizedAgent:
             
             # STEP 3: Generate final response (single LLM call)
             response_start = datetime.now()
+            logging.info(tool_results)
             final_response = await self._generate_response(
                 query,
                 analysis,
@@ -84,13 +88,13 @@ class OptimizedAgent:
         """Single LLM call for ALL analysis needs"""
         
         # Build context from chat history
-        context = self._build_context(chat_history)
+        
         
         # Create comprehensive prompt that does everything in one shot
         analysis_prompt = f"""Analyze this query comprehensively and return a complete execution plan:
 
 USER QUERY: {query}
-RECENT CONTEXT: {context}
+
 
 AVAILABLE TOOLS:
 - web_search: Search internet for current information
@@ -143,8 +147,12 @@ Return ONLY valid JSON:
 }}"""
 
         try:
-            response = await self.llm_client.generate(
-                [{"role": "user", "content": analysis_prompt}],
+            messages = chat_history
+            messages.append({"role": "user", "content": analysis_prompt})
+            with open("debug_request_payload.json", "w") as f:
+                json.dumps(messages)
+            response = await self.brain_llm.generate(
+                messages,
                 temperature=0.1,
                 system_prompt="You are an expert analyst. Analyze queries comprehensively covering semantics, business opportunities, tool needs, and communication strategy. Return valid JSON only."
             )
@@ -215,6 +223,7 @@ Return ONLY valid JSON:
         # Format tool results
         tool_data = self._format_tool_results(tool_results)
         
+        
         # Build memory context to avoid repetition
         recent_phrases = self._extract_recent_phrases(chat_history)
         
@@ -261,13 +270,17 @@ Generate a response that feels natural, helpful, and conversational."""
                 "medium": 500,
                 "detailed": 700
             }.get(strategy.get('length', 'medium'), 500)
-            
-            response = await self.llm_client.generate(
-                [{"role": "user", "content": response_prompt}],
+            messages = chat_history
+            messages.append({"role": "user", "content": response_prompt})
+            with open("debug_response_prompt.json", "w") as f:
+                f.write(json.dumps(messages))
+            response = await self.heart_llm.generate(
+                messages,
                 temperature=0.4,
-                max_tokens=max_tokens,
-                system_prompt="You are Mochand Dost - a naturally helpful AI friend who becomes a smart sales consultant when needed. Create responses that are engaging, helpful, and conversational."
+                max_tokens=1000,
+                system_prompt="You are Mochand Dost - a naturally helpful AI friend who becomes a smart sales consultant when needed. Create responses that are engaging, helpful, and conversational. Try to generate informative but completed answers in one go under 1000 characters."
             )
+            
             
             # Clean and format
             response = self._clean_response(response)
@@ -284,7 +297,7 @@ Generate a response that feels natural, helpful, and conversational."""
         if not chat_history:
             return "No previous context"
         
-        recent = chat_history[-3:] if len(chat_history) >= 3 else chat_history
+        recent = chat_history
         context_parts = []
         for item in recent:
             if 'query' in item:
@@ -292,24 +305,55 @@ Generate a response that feels natural, helpful, and conversational."""
             elif 'content' in item:
                 context_parts.append(f"{item.get('role', 'user')}: {item['content'][:100]}")
         
-        return " | ".join(context_parts) if context_parts else "No previous context"
+        return " \n ".join(context_parts) if context_parts else "No previous context"
     
-    def _format_tool_results(self, tool_results: Dict) -> str:
-        """Format tool results for response generation"""
+    def _format_tool_results(self, tool_results: dict) -> str:
+        """Format tool results for response generation, handling different tool structures."""
         if not tool_results:
             return "No external data available"
         
+        import json
+        # Save raw tool results for debugging
+        
+        
         formatted = []
+        
         for tool, result in tool_results.items():
             if isinstance(result, dict) and 'error' not in result:
-                if 'data' in result:
-                    formatted.append(f"{tool.upper()} DATA: {result['data']}")
-                elif 'result' in result:
-                    formatted.append(f"{tool.upper()} RESULT: {result['result']}")
+                # Handle RAG-style result
+                if 'success' in result and result['success']:
+                    if 'retrieved' in result:
+                        retrieved = result.get('retrieved', '')
+                        chunks = result.get('chunks', [])
+                        formatted.append(f"{tool.upper()} RETRIEVED TEXT:\n{retrieved}\n")
+                        if chunks:
+                            formatted.append(f"{tool.upper()} CHUNKS:\n" + "\n---\n".join(chunks))
+                    
+                    # Handle web search-style results
+                    elif 'results' in result and isinstance(result['results'], list):
+                        formatted.append(f"{tool.upper()} SEARCH RESULTS for query: {result.get('query', '')}\n")
+                        for item in result['results']:
+                            title = item.get('title', 'No title')
+                            snippet = item.get('snippet', '')
+                            link = item.get('link', '')
+                            formatted.append(f"- {title}\n  {snippet}\n  Link: {link}")
+                    
+                    # Generic fallback for other data/result keys
+                    elif 'data' in result:
+                        formatted.append(f"{tool.upper()} DATA:\n{result['data']}")
+                    elif 'result' in result:
+                        formatted.append(f"{tool.upper()} RESULT:\n{result['result']}")
+                    
+                    else:
+                        formatted.append(f"{tool.upper()}: Success but no recognizable content")
+                else:
+                    formatted.append(f"{tool.upper()}: No data retrieved or request failed")
+            
             elif isinstance(result, str):
                 formatted.append(f"{tool.upper()}: {result}")
         
-        return "\n".join(formatted) if formatted else "No usable tool data"
+        return "\n\n".join(formatted) if formatted else "No usable tool data"
+
     
     def _extract_recent_phrases(self, chat_history: List[Dict]) -> List[str]:
         """Extract recent phrases to avoid repetition"""

@@ -26,6 +26,7 @@ class UserQuery(BaseModel):
 
 class ChatMessage(BaseModel):
     userid: str
+    chat_history: list[dict] = []
     user_query: str
     
 from .global_config import settings
@@ -190,6 +191,8 @@ async def chat_brain_heart_system(request: ChatMessage = Body(...)):
     try:
         user_id = request.userid
         user_query = request.user_query
+        chat_history = request.chat_history if hasattr(request, 'chat_history') else []
+        
         
         logging.info(f"🧠❤️ Brain-Heart chat request - User ID: {user_id}")
         logging.info(f"🧠❤️ Message count: {len(user_query)}")
@@ -198,8 +201,9 @@ async def chat_brain_heart_system(request: ChatMessage = Body(...)):
         brain_model = settings.brain_model or os.getenv("BRAIN_LLM_MODEL")
         heart_provider = settings.heart_provider or os.getenv("HEART_LLM_PROVIDER")
         heart_model = settings.heart_model or os.getenv("HEART_LLM_MODEL")
-        use_premium_search = settings.use_premium_search
-        web_model = settings.web_model
+        # use_premium_search = settings.use_premium_search or os.getenv("USE_PREMIUM_SEARCH", "false").lower() == "true"
+        web_model = settings.web_model or os.getenv("WEB_LLM_MODEL", "")
+        use_premium_search = True
         
     
         
@@ -220,6 +224,15 @@ async def chat_brain_heart_system(request: ChatMessage = Body(...)):
             use_premium_search=use_premium_search
         )
         
+        tool_manager = ToolManager(
+            config,
+            brain_model_config,
+            web_model,
+            use_premium_search
+        )
+        
+        brain_llm = LLMClient(brain_model_config)
+        heart_llm = LLMClient(heart_model_config)
         
         # agents = await create_agents_async(
         #     config=config,
@@ -236,8 +249,9 @@ async def chat_brain_heart_system(request: ChatMessage = Body(...)):
         #     )
         
         optimizedAgent = OptimizedAgent(
-            brain_model_config,
-            web_model_config
+            brain_llm,
+            heart_llm,
+            tool_manager
         )
         
         # Process through Brain-Heart system
@@ -249,17 +263,18 @@ async def chat_brain_heart_system(request: ChatMessage = Body(...)):
         #     user_id=user_id
         # )
         
-        result = await optimizedAgent.process_query(message, [], user_id)
+        result = await optimizedAgent.process_query(user_query, chat_history, user_id)
         
         if result["success"]:
             # response_content = result["heart_result"].get("response", "No response generated")
             response_content = result['response']
-            
+            logging.info(f"✅ Brain-Heart response generated in {result.get('total_time', 0):.2f} seconds")
+            logging.info(f"🧠 Brain-Heart response: {response_content}")
             return JSONResponse(content={
                 "content": response_content[:4000],
                 "brain_time": result.get("brain_time", 0),
                 "total_time": result.get("total_time", 0),
-                "tools_used": result["brain_result"].get("tools_used", []),
+                # "tools_used": result.get("brain_result").get("tools_used", []),
                 "message_count": result.get("message_count", 0)
             }, status_code=200)
         else:

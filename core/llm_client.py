@@ -129,7 +129,8 @@ class LLMClient:
             "temperature": temperature,
             "max_tokens": max_tokens
         }
-        
+        with open("debug_payload.json", "w") as f:
+            json.dump(payload, f, indent=2)
         if hasattr(self.config, 'base_url') and self.config.base_url:
             url = f"{self.config.base_url}/chat/completions"
         else:
