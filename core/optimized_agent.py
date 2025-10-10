@@ -234,11 +234,11 @@ Perform ALL of the following analyses in ONE response:
    - If solving a problem:
      * What problem are they facing?
      * What solution did they mention, if any?
-     * What constraints do they have? (budget, location, urgency, maintenance, experience)
+     * What constraints do they have?
    
    - Final intent: Based on the above, what should we help them with?
    
-   Preserve ALL specific details: demographics, location, platforms, urgency, budget, preferences.
+   Include every specific number, measurement, name, date, and technical detail from the user's query in your intent description. If they mentioned it, it's important - keep it
 
 2. MOCHAND PRODUCT OPPORTUNITY ANALYSIS:
 
@@ -293,15 +293,16 @@ Perform ALL of the following analyses in ONE response:
     Step 1: If 2+ tools selected, detect dependencies
 
     DEFAULT = PARALLEL (tools run independently)
-    
-    Use SEQUENTIAL only if you cannot write a complete query for a tool without another tool's output.
-    
-    Test: Can I write queries for ALL tools using only the user's query right now?
-    - YES → PARALLEL
-    - NO (need to wait for results) → SEQUENTIAL
-    
-    If YES → mode="parallel"
-    If NO → mode="sequential"
+
+    Ask: "Does any tool need data from another tool's results to execute?"
+
+    Common cases:
+    - Calculator needs numbers/prices from web_search → SEQUENTIAL
+    - Web_search needs info about "our product" from rag → SEQUENTIAL  
+    - Two separate questions or topics → PARALLEL
+
+    If any tool depends on another's output → mode="sequential"
+    Otherwise → mode="parallel"
 
     Step 2: Generate queries based on POSITION in order array
 
@@ -313,8 +314,9 @@ Perform ALL of the following analyses in ONE response:
     For tools that need real queries (first tool OR parallel mode):
     Query format rules:
     - RAG: "Mochand" + [topic from query]
-    - calculator: [valid math expression like "50 * 20"]
-    - web_search: Use semantic_intent as the search query. Add "2025" at the end if time-sensitive.
+    - calculator: Extract ONLY numbers from query, create valid Python math expression (no units, no text)
+    - web_search: Transform the semantic_intent into a search query. Crucially, re-read the user's original query and preserve any words that specify WHEN (like "upcoming," "latest"), HOW MUCH (like "cheapest," "under 15000"), or WHAT TYPE (like "second-hand," "budget"). These qualifiers are critical to search accuracy. Add "2025" if time-sensitive.
+
 
     For tools that are waiting (order[1], order[2], etc. in sequential):
     - Set query to exactly: "WAIT_FOR_PREVIOUS"
@@ -611,28 +613,43 @@ Return ONLY valid JSON:
         
         # SPECIAL HANDLING FOR CALCULATOR
         if next_tool == "calculator":
-            middleware_prompt = f"""Extract numbers from the data for calculation.
+            middleware_prompt = f"""Extract numbers from data and create a math expression.
 
-    ORIGINAL USER QUERY: {original_query}
+        ORIGINAL USER QUERY: {original_query}
 
-    PREVIOUS TOOL RESULTS:
-    {previous_summary}
+        DATA FROM PREVIOUS TOOLS:
+        {previous_summary}
 
-    Your task: Find numerical values (prices, percentages, quantities) in the data above and create a math expression.
+        YOUR TASK:
+        1. Find all numbers in the data above
+        2. Understand what calculation the user wants from their query
+        3. Create a valid Python math expression
 
-    Rules:
-    - Look for prices: ₹20,000 → 20000, $500 → 500
-    - Look for percentages: 15% → 0.15
-    - Based on query intent, create expression:
-    * Compare/difference → "number1 - number2"
-    * Total/sum → "number1 + number2"
-    * Percentage of → "number1 * 0.XX"
+        RULES:
+        - Extract numbers only (remove ₹, $, %, commas)
+        - Use operators: + - * / ( )
+        - Match the calculation to user's query intent:
+        * "total" or "sum" → add numbers
+        * "difference" or "compare" → subtract
+        * "multiply" or "times" → multiply
+        * "percentage" or "discount" → multiply by decimal (15% = 0.15)
+        * Complex queries → use parentheses for order
 
-    Examples:
-    - If data shows "Mochand: ₹20,000" and "Competitor: $500" and query is "compare pricing" → "20000 - 500"
-    - If data shows "Price: $100" and query is "calculate 15% discount" → "100 * 0.15"
+        EXAMPLES:
+        Query: "compare prices", Data: "Item A: $2000, Item B: $1500"
+        → "2000 - 1500"
 
-    Return ONLY a valid math expression (e.g., "20000 - 500"). If no clear numbers found, return "SKIP"."""
+        Query: "calculate 15% of 5000", Data: none needed
+        → "5000 * 0.15"
+
+        Query: "total cost for 3 items at 500 each", Data: "Price: ₹500"
+        → "500 * 3"
+
+        Query: "trip cost", Data: "Bus ₹600, Hotel ₹1000/night for 7 days, Food ₹200/day"
+        → "600 + (1000*7) + (200*7)"
+
+        Return ONLY a valid math expression. If you cannot determine what to calculate, return "SKIP"."""
+
         
         else:
            middleware_prompt = f"""Create a GENERIC industry search query based on previous data.
