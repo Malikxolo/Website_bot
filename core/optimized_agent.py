@@ -285,26 +285,36 @@ Perform ALL of the following analyses in ONE response:
    - Include every specific number, measurement, name, date, and technical detail from the user's query
 
 3. MOCHAND PRODUCT OPPORTUNITY ANALYSIS:
+   Does the user's query relate to problems that Mochand's AI chatbot solution can solve?
 
-   WHAT MOCHAND DOES (context for understanding):
-   - AI chatbot for customer communication automation
-   - Supports WhatsApp, Facebook, Instagram messaging
-   - Automates customer support, 24/7 availability
-   - Handles repetitive customer queries
-   - Integrates with CRM/payment systems
-   
-   DECISION LOGIC (strict matching):
-   Step 1: Does query contain these EXACT keywords?
-   - "customer" OR "client" OR "support" OR "service" OR "chat" OR "messaging" OR "communication"
-   
-   Step 2: Is user seeking solutions (not definitions)?
-   
-   If BOTH YES → business_opportunity.detected = true
-   Otherwise → business_opportunity.detected = false
-   
-   EXCLUDE (even if problems mentioned):
-   - Vague queries without keywords ("maintaining business", "business troubles")  
-   - Other domains: accounting, inventory, HR, logistics
+   MOCHAND-SPECIFIC TRIGGERS (check for these pain points):
+   - Customer support automation needs
+   - High customer service costs or staff burden 
+   - Need for 24/7 customer availability
+   - Multiple messaging platform management difficulties (WhatsApp, Facebook, Instagram)
+   - Repetitive customer query handling
+   - Customer engagement/response time issues
+   - Integration needs with CRM/payment systems for customer communication
+   - Scaling customer communication challenges
+
+   Set business_opportunity.detected = true if query shows ANY of:
+   - User states a current problem/challenge
+   - User is actively seeking/evaluating solutions
+   - User expresses dissatisfaction with current situation
+   - User mentions "need", "looking for", "considering", "want to improve"
+
+   DO NOT trigger business_opportunity.detected = true for:
+   - Pure research/comparison without context ("Compare X vs Y")
+   - Definition questions ("What is X")
+   - General knowledge inquiries
+
+   If business opportunity detected:
+   - Set business_opportunity.detected = true
+   - Add "rag" to tools_to_use (fetch Mochand product docs)
+
+   If query is about other business areas (accounting, inventory, website, etc.):
+   - Set business_opportunity.detected = false
+
 
 4. TOOL SELECTION FOR MULTI-TASK QUERIES:
 
@@ -906,9 +916,9 @@ Return ONLY valid JSON:
             
             response = await self.heart_llm.generate(
                 messages,
-                temperature=0.4,
+                temperature=0.2,
                 max_tokens=4000,
-                system_prompt="You are Mochand Dost, a conversational AI assistant. Always respond with natural, friendly conversation - never with JSON, analysis, or structured data. Be warm and helpful."
+                system_prompt="You are Mochand Dost, a conversational AI assistant. If business oppurtunity is true, then try to pitch mochand .Always respond with natural, friendly conversation - never with JSON, analysis, or structured data. Be warm and helpful."
             )
             
             # LOG: Raw response from Heart LLM

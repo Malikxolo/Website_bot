@@ -201,7 +201,7 @@ class WebSearchTool(BaseTool):
             }
     
     async def _scrapingdog_search(self, query: str, num_results: int, scrape_top: int = 3) -> Dict[str, Any]:
-        """Search using ScrapingDog Google SERP API"""
+        """Search using ScrapingDog Google SERP API with concurrent scraping"""
         
         params = {
             "api_key": self.api_key,
@@ -221,38 +221,55 @@ class WebSearchTool(BaseTool):
             
             data = await response.json()
             
-            results = []
-            for item in data.get("organic_results", [])[:num_results]: 
-                results.append({
+            # Build results list
+            results = [
+                {
                     "title": item.get("title", ""),
                     "snippet": item.get("snippet", ""),
                     "link": item.get("link", ""),
                     "position": item.get("rank", 0)
-                })
+                }
+                for item in data.get("organic_results", [])[:num_results]
+            ]
             
-            # Scrape top results with Jina
-            if scrape_top > 0 and self.jina_api_key:
-                logger.info(f" Starting Jina scraping for top {scrape_top} results...")
+            # Scrape top results CONCURRENTLY with Jina
+            scraped_count = 0
+            if scrape_top > 0 and self.jina_api_key and results:
+                logger.info(f"🔄 Starting concurrent Jina scraping for top {scrape_top} results...")
+                
+                # Create scraping tasks for all URLs at once
+                scrape_tasks = []
+                urls_to_scrape = []
                 
                 for i, result in enumerate(results[:scrape_top]):
                     url = result.get("link", "")
                     if url:
-                        logger.info(f" [{i+1}/{scrape_top}] Scraping: {url}")
-                        scraped = await self._scrape_with_jina(url)
-                        result["scraped_content"] = scraped[:3000]
-                        
-                        if scraped.startswith("["):
-                            logger.warning(f" Failed: {scraped}")
+                        urls_to_scrape.append((i, url))
+                        scrape_tasks.append(self._scrape_with_jina(url))
+                
+                # Execute all scraping tasks concurrently
+                if scrape_tasks:
+                    scraped_results = await asyncio.gather(*scrape_tasks, return_exceptions=True)
+                    
+                    # Assign scraped content back to results
+                    for (idx, url), scraped in zip(urls_to_scrape, scraped_results):
+                        if isinstance(scraped, Exception):
+                            logger.warning(f"❌ [{idx+1}] Scraping failed for {url}: {scraped}")
+                            results[idx]["scraped_content"] = f"[Scraping failed: {str(scraped)}]"
+                        elif scraped.startswith("["):
+                            logger.warning(f"⚠️ [{idx+1}] {scraped}")
+                            results[idx]["scraped_content"] = scraped
                         else:
-                            logger.info(f" Scraped {len(scraped)} chars")
-                            logger.debug(f" Preview: {scraped[:200]}...")
+                            results[idx]["scraped_content"] = scraped[:3000]
+                            scraped_count += 1
+                            logger.info(f"✅ [{idx+1}] Scraped {len(scraped)} chars from {url}")
             
             return {
                 "success": True,
                 "query": query,
                 "results": results,
                 "total_results": len(results),
-                "scraped_count": min(scrape_top, len(results)) if scrape_top > 0 and self.jina_api_key else 0,
+                "scraped_count": scraped_count,
                 "provider": "scrapingdog"
             }
 

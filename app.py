@@ -453,7 +453,7 @@ def display_real_results(result: Dict[str, Any], query: str):
             business_opp = analysis.get('business_opportunity', {})
             if business_opp.get('detected'):
                 st.markdown("**Business Opportunity Detected:**")
-                st.markdown(f"- Score: {business_opp.get('score', 0)}/100")
+                st.markdown(f"- Score: {business_opp.get('composite_confidence', 0)}/100")
                 st.markdown(f"- Pain Points: {', '.join(business_opp.get('pain_points', []))}")
             
             if tools_used:
