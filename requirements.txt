@@ -55,3 +55,7 @@ pytest>=7.0.0
 black>=22.0.0
 python-json-logger
 python-multipart
+
+mem0ai
+langchain-neo4j
+rank-bm25

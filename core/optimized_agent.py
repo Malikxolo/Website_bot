@@ -9,6 +9,30 @@ import logging
 import asyncio
 from typing import Dict, List, Any, Optional
 from datetime import datetime
+from dotenv import load_dotenv
+load_dotenv()
+from os import getenv
+from mem0 import AsyncMemory
+from mem0.configs.base import MemoryConfig
+
+
+config = MemoryConfig(
+    graph_store={
+        "provider": "neo4j",
+        "config": {
+            "url": getenv('NEO4J_URL'),
+            "username": getenv('NEO4J_USER'),
+            "password": getenv('NEO4J_PASSWORD')
+        }
+    },
+    vector_store={
+        "provider": "chroma",
+        "config": {
+            "collection_name": "mem0_collection",
+            "path": ".chromadb"
+        }
+    }
+)
 
 logger = logging.getLogger(__name__)
 
@@ -53,13 +77,14 @@ class OptimizedAgent:
         self.heart_llm = heart_llm
         self.tool_manager = tool_manager
         self.available_tools = tool_manager.get_available_tools()
+        self.memory = AsyncMemory(config)
         logger.info(f"OptimizedAgent initialized with tools: {self.available_tools}")
     
     async def process_query(self, query: str, chat_history: List[Dict] = None, user_id: str = None) -> Dict[str, Any]:
         """Process query with minimal LLM calls"""
         logger.info(f" PROCESSING QUERY: '{query}'")
         start_time = datetime.now()
-        
+        history = [{"role":"user", "content":query}]
         logger.info(f" DEBUG CHAT HISTORY:")
         logger.info(f"   Type: {type(chat_history)}")
         logger.info(f"   Length: {len(chat_history) if chat_history else 0}")
@@ -68,11 +93,17 @@ class OptimizedAgent:
         logger.info(f"   Is None?: {chat_history is None}")
         
         try:
-            # STEP 1: Single comprehensive analysis (combines semantic + business + planning + dependency detection)
+            memory_results = await self.memory.search(query, user_id=user_id, limit=5)
+            memories = "\n".join([
+                f"- {item['memory']}" 
+                for item in memory_results.get("results", []) 
+                if item.get("memory")
+            ]) or "No previous context."
+
+            logger.info(f" Retrieved memories: {memories}")
             analysis_start = datetime.now()
-            with open("debug_analysis_prompt.json", "w") as f:
-                f.write(json.dumps(chat_history))
-            analysis = await self._comprehensive_analysis(query, chat_history)
+            
+            analysis = await self._comprehensive_analysis(query, chat_history, memories)
             analysis_time = (datetime.now() - analysis_start).total_seconds()
             logger.info(f" Analysis completed in {analysis_time:.2f}s")
             
@@ -127,8 +158,11 @@ class OptimizedAgent:
                 query,
                 analysis,
                 tool_results,
-                chat_history
+                chat_history,
+                memories=memories
             )
+            history.append({"role":"assistant", "content":final_response})
+            await self.memory.add(history, user_id=user_id)
             response_time = (datetime.now() - response_start).total_seconds()
             logger.info(f" Response generated in {response_time:.2f}s")
             
@@ -200,7 +234,7 @@ class OptimizedAgent:
         
         return guides.get(emotion, {}).get(intensity, "Be naturally helpful and friendly")
 
-    async def _comprehensive_analysis(self, query: str, chat_history: List[Dict] = None) -> Dict[str, Any]:
+    async def _comprehensive_analysis(self, query: str, chat_history: List[Dict] = None, memories:str = "") -> Dict[str, Any]:
         """Single LLM call for ALL analysis needs"""
         logger.info(f" ANALYSIS DEBUG:")
         logger.info(f"   Chat History Type: {type(chat_history)}")
@@ -211,10 +245,11 @@ class OptimizedAgent:
         context = self._build_context(chat_history)
         logger.info(f"   Built Context: '{context}'")
         
+        
         # Create comprehensive prompt that does everything in one shot
         analysis_prompt = f"""Analyze this query using multi-signal intelligence and return a complete execution plan:
 
-CONVERSATION CONTEXT: {context}
+CONVERSATION CONTEXT: {memories}
 USER QUERY: {query}
 
 AVAILABLE TOOLS:
@@ -451,8 +486,7 @@ Return ONLY valid JSON:
         try:
             messages = []
             messages.append({"role": "user", "content": analysis_prompt})
-            with open("debug_request_payload.json", "w") as f:
-                json.dumps(messages)
+            
             
             logger.info(f" CALLING BRAIN LLM for analysis...")
             response = await self.brain_llm.generate(
@@ -760,8 +794,7 @@ Return ONLY valid JSON:
         
         try:
             logger.info(f"🔄 Calling middleware LLM...")
-            with open("debug_middleware_prompt.txt", "w", encoding="utf8") as f:
-                f.write(middleware_prompt)
+            
             response = await self.brain_llm.generate(
                 [{"role": "user", "content": middleware_prompt}],
                 temperature=0.4,
@@ -778,7 +811,7 @@ Return ONLY valid JSON:
             return original_query
 
     
-    async def _generate_response(self, query: str, analysis: Dict, tool_results: Dict, chat_history: List[Dict]) -> str:
+    async def _generate_response(self, query: str, analysis: Dict, tool_results: Dict, chat_history: List[Dict], memories:str="") -> str:
         """Generate response with simple business mode switching like old system"""
         
         # Extract key elements
@@ -827,8 +860,8 @@ Return ONLY valid JSON:
     AVAILABLE DATA TO USE NATURALLY:
     {tool_data}
 
-    CONVERSATION MEMORY - Don't repeat these recent patterns:
-    {recent_phrases}
+    CONVERSATION MEMORY:
+    {memories}
 
     RESPONSE REQUIREMENTS:
     - Personality: {strategy.get('personality', 'helpful_dost')}
@@ -867,10 +900,10 @@ Return ONLY valid JSON:
             logger.info(f" CALLING HEART LLM for response generation...")
             logger.info(f" Max tokens: {max_tokens}, Temperature: 0.4")
             
-            messages = chat_history if chat_history else []
+            # messages = chat_history if chat_history else []
+            messages = []
             messages.append({"role": "user", "content": response_prompt})
-            with open("debug_response_prompt.json", "w") as f:
-                f.write(json.dumps(messages))
+            
             response = await self.heart_llm.generate(
                 messages,
                 temperature=0.4,

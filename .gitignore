@@ -52,3 +52,5 @@ results/
 *.json
 *.csv
 *.xlsx
+
+.chromadb/

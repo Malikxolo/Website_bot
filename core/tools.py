@@ -167,7 +167,7 @@ class WebSearchTool(BaseTool):
         self.api_key = api_key
         self.provider = provider
         self.web_model = web_model
-        self.jina_api_key = jina_api_key  
+        self.jina_api_key = os.getenv("JINA_API_KEY")
         self.session = None
         
         print(f"WebSearchTool initialized with provider: {provider}, model: {web_model}")
@@ -239,7 +239,7 @@ class WebSearchTool(BaseTool):
                     if url:
                         logger.info(f" [{i+1}/{scrape_top}] Scraping: {url}")
                         scraped = await self._scrape_with_jina(url)
-                        result["scraped_content"] = scraped
+                        result["scraped_content"] = scraped[:3000]
                         
                         if scraped.startswith("["):
                             logger.warning(f" Failed: {scraped}")
