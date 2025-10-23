@@ -1,6 +1,7 @@
 from fastapi import FastAPI, APIRouter, UploadFile, File, Form
 from fastapi.responses import JSONResponse
 from fastapi import Body
+from contextlib import asynccontextmanager
 from langchain_core.messages import HumanMessage, AIMessage
 import logging
 router = APIRouter()
@@ -13,6 +14,54 @@ from core import (
 from core.optimized_agent import OptimizedAgent
 import json
 import shutil
+import asyncio
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    
+    logging.info("⚡ Starting app lifespan...")
+    
+    global optimizedAgent
+    config = Config()
+
+    brain_model_config = config.create_llm_config(
+        provider=settings.brain_provider,
+        model=settings.brain_model,
+        max_tokens=1000
+    )
+    heart_model_config = config.create_llm_config(
+        provider=settings.heart_provider,
+        model=settings.heart_model,
+        max_tokens=1000
+    )
+    web_model_config = config.get_tool_configs(
+        web_model=settings.web_model,
+        use_premium_search=settings.use_premium_search
+    )
+
+    brain_llm = LLMClient(brain_model_config)
+    heart_llm = LLMClient(heart_model_config)
+    tool_manager = ToolManager(config, brain_llm, web_model_config, settings.use_premium_search)
+
+    optimizedAgent = OptimizedAgent(brain_llm, heart_llm, tool_manager)
+
+    
+    optimizedAgent.worker_task = asyncio.create_task(
+        optimizedAgent.background_task_worker()
+    )
+    logging.info("✅ OptimizedAgent background worker started")
+
+    try:
+        yield
+    finally:
+        
+        logging.info("⚡ Shutting down app lifespan...")
+        optimizedAgent.worker_task.cancel()
+        try:
+            await optimizedAgent.worker_task
+        except asyncio.CancelledError:
+            logging.info("✅ OptimizedAgent worker cancelled cleanly")
+
 
 from pydantic import BaseModel
 from typing import List, Dict, Any, Optional
@@ -234,19 +283,6 @@ async def chat_brain_heart_system(request: ChatMessage = Body(...)):
         brain_llm = LLMClient(brain_model_config)
         heart_llm = LLMClient(heart_model_config)
         
-        # agents = await create_agents_async(
-        #     config=config,
-        #     brain_model_config=brain_model_config,
-        #     heart_model_config=heart_model_config,
-        #     web_model_config=web_model_config,
-        #     use_premium_search=use_premium_search
-        # )
-        
-        # if agents["status"] != "success":
-        #     return JSONResponse(
-        #         content={"error": f"Failed to create agents: {agents['error']}"}, 
-        #         status_code=500
-        #     )
         
         optimizedAgent = OptimizedAgent(
             brain_llm,
@@ -254,29 +290,15 @@ async def chat_brain_heart_system(request: ChatMessage = Body(...)):
             tool_manager
         )
         
-        # Process through Brain-Heart system
-        # result = await process_query_real(
-        #     query=user_query,
-        #     brain_agent=agents["brain_agent"],
-        #     heart_agent=agents["heart_agent"],
-        #     style="helpful",  # Default style, could be parameterized
-        #     user_id=user_id
-        # )
+        
         
         result = await optimizedAgent.process_query(user_query, chat_history, user_id)
         
         if result["success"]:
-            # response_content = result["heart_result"].get("response", "No response generated")
-            response_content = result['response']
+            
             logging.info(f"✅ Brain-Heart response generated in {result.get('total_time', 0):.2f} seconds")
-            logging.info(f"🧠 Brain-Heart response: {response_content}")
-            return JSONResponse(content={
-                "content": response_content[:4000],
-                "brain_time": result.get("brain_time", 0),
-                "total_time": result.get("total_time", 0),
-                # "tools_used": result.get("brain_result").get("tools_used", []),
-                "message_count": result.get("message_count", 0)
-            }, status_code=200)
+            logging.info(f"🧠 Brain-Heart response: {result['response']}")
+            return JSONResponse(content=result, status_code=200)
         else:
             return JSONResponse(
                 content={"error": result["error"]}, 

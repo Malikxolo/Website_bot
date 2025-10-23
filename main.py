@@ -1,11 +1,13 @@
-from api.chat import router as chat_router
+from api.chat import router as chat_router, lifespan
 from fastapi import FastAPI
 import logging
 import os
 from starlette.middleware.cors import CORSMiddleware
 
 
-app = FastAPI(title="🧠❤️ Brain-Heart Agent API", version="1.0.0")
+
+
+app = FastAPI(title="🧠❤️ Brain-Heart Agent API", version="1.0.0", lifespan=lifespan)
 app.include_router(chat_router, prefix="/api", tags=["chat"])
 app.add_middleware(
     CORSMiddleware,

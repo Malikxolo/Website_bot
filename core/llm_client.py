@@ -126,6 +126,9 @@ class LLMClient:
         payload = {
             "model": self.config.model,
             "messages": messages,
+            "provider": {
+              'sort': 'throughput'  
+            },
             "temperature": temperature,
             "max_tokens": max_tokens
         }

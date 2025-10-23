@@ -13,7 +13,9 @@ from dotenv import load_dotenv
 load_dotenv()
 from os import getenv
 from mem0 import AsyncMemory
+from functools import partial
 from mem0.configs.base import MemoryConfig
+from .config import AddBackgroundTask
 
 
 config = MemoryConfig(
@@ -78,13 +80,15 @@ class OptimizedAgent:
         self.tool_manager = tool_manager
         self.available_tools = tool_manager.get_available_tools()
         self.memory = AsyncMemory(config)
+        self.task_queue: asyncio.Queue["AddBackgroundTask"] = asyncio.Queue()
+        self._worker_started = False
         logger.info(f"OptimizedAgent initialized with tools: {self.available_tools}")
     
     async def process_query(self, query: str, chat_history: List[Dict] = None, user_id: str = None) -> Dict[str, Any]:
         """Process query with minimal LLM calls"""
+        self._start_worker_if_needed()
         logger.info(f" PROCESSING QUERY: '{query}'")
         start_time = datetime.now()
-        history = [{"role":"user", "content":query}]
         logger.info(f" DEBUG CHAT HISTORY:")
         logger.info(f"   Type: {type(chat_history)}")
         logger.info(f"   Length: {len(chat_history) if chat_history else 0}")
@@ -161,8 +165,16 @@ class OptimizedAgent:
                 chat_history,
                 memories=memories
             )
-            history.append({"role":"assistant", "content":final_response})
-            await self.memory.add(history, user_id=user_id)
+            
+            await self.task_queue.put(
+                AddBackgroundTask(
+                    func=partial(self.memory.add),
+                    params=(
+                        [{"role": "user", "content": query}, {"role": "assistant", "content": final_response}],
+                        user_id,
+                    ),
+                )
+            )
             response_time = (datetime.now() - response_start).total_seconds()
             logger.info(f" Response generated in {response_time:.2f}s")
             
@@ -198,6 +210,33 @@ class OptimizedAgent:
                 "error": str(e),
                 "response": "I apologize, but I encountered an error. Please try again."
             }
+            
+    async def background_task_worker(self) -> None:
+        while True:
+            task: AddBackgroundTask = await self.task_queue.get()
+            try:
+    
+                func_name = getattr(task.func, "func", task.func).__name__ if hasattr(task.func, "__name__") else repr(task.func)
+                logger.info(f"Executing background task: {func_name}")
+                messages,user_id = task.params
+                logger.info(f" Background task params: messages length={len(messages)}, user_id={user_id}")
+                await task.func(messages=messages, user_id=user_id)
+
+            except asyncio.CancelledError:
+    
+                break
+            except Exception as e:
+                logger.error(f"Error executing background task: {e}")
+            finally:
+                self.task_queue.task_done()
+
+                
+    def _start_worker_if_needed(self):
+        """Start background worker once, on first use"""
+        if not self._worker_started:
+            asyncio.create_task(self.background_task_worker())
+            self._worker_started = True
+            logging.info("✅ OptimizedAgent background worker started")
     
     def _build_sentiment_language_guide(self, sentiment: Dict) -> str:
         """Build sentiment-driven language guidance"""

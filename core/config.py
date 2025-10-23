@@ -8,6 +8,13 @@ from typing import Dict, List, Optional, Any
 from dataclasses import dataclass
 from dotenv import load_dotenv, find_dotenv
 load_dotenv(find_dotenv())
+from typing import Callable, Coroutine, Tuple, Any
+
+@dataclass
+class AddBackgroundTask:
+    """Dataclass for adding message task"""
+    func: Callable[..., Coroutine[Any, Any, Any]]
+    params: Tuple[Any, ...]
 
 @dataclass
 class LLMConfig:

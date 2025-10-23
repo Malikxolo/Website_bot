@@ -16,11 +16,46 @@ from datetime import datetime, timezone
 from typing import Dict, Any, Optional, List
 import sys
 import logging.config
+import requests
 from chroma_log_handler import ChromaLogHandler
 from dotenv import load_dotenv
+import aiohttp
 from core.google_drive_integration import render_multi_account_drive_picker, cleanup_multi_account_session
 
 load_dotenv()
+
+def upload_local_files(user_id: str, collection_name: str, files):
+
+    url = "http://localhost:8030/api/collections/create/local"
+    form_data = {
+        "user_id": user_id,
+        "collection_name": collection_name,
+    }
+    files_data = [
+        ("files", (uploaded_file.name, uploaded_file.read(), uploaded_file.type or "application/octet-stream"))
+        for uploaded_file in files
+    ]
+
+    response = requests.post(url, data=form_data, files=files_data)
+    return response.json()
+
+async def mog_query(user_id: str, chat_history:List, query: str):
+    url = "http://localhost:8030/api/chat"
+    headers = {
+        "accept": "application/json",
+        "Content-Type": "application/json"
+    }
+    payload = {
+        "userid": user_id,
+        "chat_history": chat_history,
+        "user_query": query
+    }
+
+    async with aiohttp.ClientSession() as session:
+        async with session.post(url, headers=headers, json=payload) as response:
+            response_data = await response.json()
+            return response_data
+
 
 # Initialize user_id FIRST (before logging)
 if 'user_id' not in st.session_state:
@@ -139,29 +174,44 @@ def cleanup_expired_sessions():
 
 
 
-# @st.cache_resource
-# def start_background_cleanup():
-#     """Start background cleanup service - CACHED to prevent multiple threads"""
-#     def worker():
-#         logger.info("🕐 Background worker starting, waiting 60 seconds...")
-#         time.sleep(60)  # Initial delay
+@st.cache_resource
+def start_agent_background_worker(_agent):
+    """Start agent's background memory worker - FIXED VERSION"""
+    try:
+        # Create a dedicated event loop for the background worker thread
+        # This loop will persist and won't interfere with main thread loops
+        def run_worker():
+            # Create a new loop for this thread
+            logger.info("Starting agent background worker thread...")
+            worker_loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(worker_loop)
+            
+            try:
+                worker_loop.run_until_complete(_agent.background_task_worker())
+            except Exception as e:
+                logger.error(f"Background worker error: {e}")
+            finally:
+                # Clean up this thread's loop
+                try:
+                    pending = asyncio.all_tasks(worker_loop)
+                    for task in pending:
+                        task.cancel()
+                    if pending:
+                        worker_loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+                except Exception as cleanup_error:
+                    logger.warning(f"Worker cleanup warning: {cleanup_error}")
+                finally:
+                    worker_loop.close()
         
-#         while True:
-#             try:
-#                 logger.info("🕐 Running scheduled background cleanup...")
-#                 cleanup_expired_sessions()
-#                 logger.info("🕐 Background cleanup completed, sleeping 1 hour...")
-#                 time.sleep(3600)  # Run every hour
-#             except Exception as e:
-#                 logger.error(f"❌ Background cleanup error: {e}")
-#                 time.sleep(3600)
+        # Start the worker in a daemon thread
+        thread = threading.Thread(target=run_worker, daemon=True)
+        thread.start()
+        logger.info("✅ Agent background worker started with isolated event loop")
+        return "started"
     
-#     thread = threading.Thread(target=worker, daemon=True)
-#     thread.start()
-#     logger.info("🔄 Background cleanup service started (cached)")
-    
-#     return "started"  # Return something so cache works
-
+    except Exception as e:
+        logger.error(f"Failed to start agent worker: {e}")
+        return None
 
 
 def get_user_id():
@@ -392,7 +442,7 @@ async def process_query_real(query: str, optimized_agent, style: str, user_id: s
         
         # Single agent processing
         st.info("🚀 Optimized Agent processing query...")
-        result = await optimized_agent.process_query(query, chat_history=chat_history, user_id=user_id)
+        result = await mog_query(user_id, chat_history, query)
         
         total_time = time.time() - start_time
         
@@ -661,7 +711,7 @@ def main():
         # Create collection button
         col1, col2 = st.columns(2)
         with col1:
-            if st.button("✅ Create Collection", key="create_collection"):
+            if st.button("✅ Create Collection", key="upload_local_files"):
                 if not collection_name.strip():
                     st.error("❌ Please enter collection name")
                 else:
@@ -682,7 +732,8 @@ def main():
                             if has_local_files:
                                 # Local files - existing logic
                                 st.info("📁 Processing local files...")
-                                if create_collection(get_user_id(), collection_name, uploaded_files):
+                                res = upload_local_files(get_user_id(), collection_name, uploaded_files)
+                                if res:
                                     elapsed = time.time() - start_time
                                     st.success(f"✅ Collection created in {elapsed:.1f}s!")
                                     st.success("✅ Collection created from local files!")
@@ -821,6 +872,19 @@ def main():
                         st.json(agents_result)
                 else:
                     # Process query with optimized agent
+                    
+                    if not st.session_state.get("agent_worker_started", False):
+                        try:
+                            # Call the cached start function with the actual agent
+                            start_agent_background_worker(agents_result["optimized_agent"])
+                            st.session_state["agent_worker_started"] = True
+                            logger.info("Agent background worker requested (st.session_state set).")
+                        except Exception as e:
+                            logger.error(f"Failed to start background worker: {e}")
+                            # Optionally show to user
+                            if show_debug:
+                                st.warning(f"Background worker start error: {e}")
+                                
                     result = asyncio.run(process_query_real(
                         query, 
                         agents_result["optimized_agent"], 
@@ -828,6 +892,7 @@ def main():
                         user_id=get_user_id(),
                         chat_history=st.session_state.chat_history
                     ))
+                    
                     if result.get("success"):
                         # Update chat history
                         st.session_state.chat_history.extend([
