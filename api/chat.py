@@ -1,6 +1,9 @@
-from fastapi import FastAPI, APIRouter, UploadFile, File, Form
+from fastapi import FastAPI, APIRouter, UploadFile, File, Form, Depends
 from fastapi.responses import JSONResponse
 from fastapi import Body
+from fastapi_limiter import FastAPILimiter
+from fastapi_limiter.depends import RateLimiter
+from redis.asyncio import Redis
 from contextlib import asynccontextmanager
 from langchain_core.messages import HumanMessage, AIMessage
 import logging
@@ -24,6 +27,8 @@ async def lifespan(app: FastAPI):
     global optimizedAgent
     config = Config()
 
+    redis_client = Redis(host=os.getenv('REDIS_HOST'), port=os.getenv('REDIS_PORT'), decode_responses=os.getenv('REDIS_DECODE_RESPONSES'), username=os.getenv('REDIS_USERNAME'), password=os.getenv('REDIS_PASSWORD'))
+    await FastAPILimiter.init(redis_client)
     brain_model_config = config.create_llm_config(
         provider=settings.brain_provider,
         model=settings.brain_model,
@@ -233,7 +238,7 @@ async def set_brain_heart_agents(request: UpdateAgentsRequest):
     })
 
 
-@router.post("/chat")
+@router.post("/chat", dependencies=[Depends(RateLimiter(times=6, seconds=60))])
 async def chat_brain_heart_system(request: ChatMessage = Body(...)):
     """New endpoint specifically for Brain-Heart system with messages support"""
     
@@ -250,9 +255,8 @@ async def chat_brain_heart_system(request: ChatMessage = Body(...)):
         brain_model = settings.brain_model or os.getenv("BRAIN_LLM_MODEL")
         heart_provider = settings.heart_provider or os.getenv("HEART_LLM_PROVIDER")
         heart_model = settings.heart_model or os.getenv("HEART_LLM_MODEL")
-        # use_premium_search = settings.use_premium_search or os.getenv("USE_PREMIUM_SEARCH", "false").lower() == "true"
+        use_premium_search = settings.use_premium_search or os.getenv("USE_PREMIUM_SEARCH", "false").lower() == "true"
         web_model = settings.web_model or os.getenv("WEB_LLM_MODEL", "")
-        use_premium_search = True
         
     
         
@@ -312,75 +316,7 @@ async def chat_brain_heart_system(request: ChatMessage = Body(...)):
             status_code=500
         )
 
-# Additional utility endpoints
 
-
-
-@router.get("/chat/memory/{user_id}")
-async def get_user_memory(user_id: str):
-    """Get memory summary for a specific user"""
-    
-    try:
-        # You'll need to access the brain agent instance
-        # This assumes it's available through some dependency injection or global state
-        agents = await create_agents_async(
-            config=None,  # Your config here
-            brain_model_config=None,  # Your brain model config
-            heart_model_config=None,  # Your heart model config
-            web_model_config=None,  # Your web model config
-            use_premium_search=False
-        )
-        
-        if agents["status"] != "success":
-            return JSONResponse(
-                content={"error": f"Failed to create agents: {agents['error']}"}, 
-                status_code=500
-            )
-        
-        memory_summary = agents["brain_agent"].get_memory_summary()
-        
-        return JSONResponse(content={
-            "user_id": user_id,
-            "memory_summary": memory_summary
-        }, status_code=200)
-        
-    except Exception as e:
-        logging.error(f"❌ Memory retrieval failed: {str(e)}")
-        return JSONResponse(
-            content={"error": f"Memory retrieval failed: {str(e)}"}, 
-            status_code=500
-        )
-
-@router.post("/chat/single-query")
-async def chat_single_query_legacy(query: str = Body(...), user_id: str = Body(...)):
-    """Legacy endpoint for single query processing (backward compatibility)"""
-    
-    try:
-        # Convert single query to messages format
-        messages = [{"role": "user", "content": query}]
-        
-        # Create a mock ChatMessage request
-        class MockUserQuery:
-            def __init__(self, messages):
-                self.messages = [QueryMessage(role=msg["role"], content=msg["content"]) for msg in messages]
-        
-        class MockChatMessage:
-            def __init__(self, userid, user_query):
-                self.userid = userid
-                self.user_query = user_query
-        
-        mock_request = MockChatMessage(user_id, MockUserQuery(messages))
-        
-        # Process through the Brain-Heart system
-        return await chat_brain_heart_system(mock_request)
-        
-    except Exception as e:
-        logging.error(f"❌ Single query processing failed: {str(e)}")
-        return JSONResponse(
-            content={"error": f"Single query processing failed: {str(e)}"}, 
-            status_code=500
-        )
-        
 
 @router.get("/get-collections")
 async def get_collections():

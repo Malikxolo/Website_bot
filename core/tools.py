@@ -19,6 +19,7 @@ from .exceptions import ToolExecutionError
 from .quota_manager import QuotaManager
 from .llm_client import LLMClient
 from .web_search_agent import search_perplexity
+import ast
 
 logger = logging.getLogger(__name__)
 class BaseTool(ABC):
@@ -59,7 +60,7 @@ class CalculatorTool(BaseTool):
         )
     
     async def execute(self, query: str = None, expression: str = None, 
-                    operation: str = None, numbers: List[float] = None, **kwargs) -> Dict[str, Any]:
+                      operation: str = None, numbers: List[float] = None, **kwargs) -> Dict[str, Any]:
         """Execute mathematical operations"""
         
         self._record_usage()
@@ -81,43 +82,83 @@ class CalculatorTool(BaseTool):
                 "error": f"Calculation error: {str(e)}",
                 "tool": self.name
             }
-    
+
     async def _evaluate_expression(self, expression: str) -> Dict[str, Any]:
-        """Safely evaluate mathematical expression"""
-        
-        # Simple security check
-        dangerous_patterns = ['import', 'exec', 'eval', '__']
-        if any(pattern in expression.lower() for pattern in dangerous_patterns):
-            return {
-                "success": False,
-                "error": "Expression contains potentially dangerous operations"
-            }
-        
+        """Safely evaluate mathematical expression using AST parsing"""
+
+        allowed_names = {
+            "abs": abs, "round": round, "min": min, "max": max, "sum": sum,
+            "sqrt": math.sqrt, "pow": pow, "log": math.log, "exp": math.exp,
+            "sin": math.sin, "cos": math.cos, "tan": math.tan,
+            "pi": math.pi, "e": math.e
+        }
+
         try:
-            # Safe evaluation with limited scope
-            allowed_names = {
-                "abs": abs, "round": round, "min": min, "max": max, "sum": sum,
-                "sqrt": math.sqrt, "pow": pow, "log": math.log, "exp": math.exp,
-                "sin": math.sin, "cos": math.cos, "tan": math.tan,
-                "pi": math.pi, "e": math.e
-            }
-            
-            result = eval(expression, {"__builtins__": {}}, allowed_names)
-            
+            tree = ast.parse(expression, mode='eval')
+            result = self._safe_eval_ast(tree.body, allowed_names)
             return {
                 "success": True,
                 "result": result,
                 "expression": expression,
                 "formatted_result": f"{result:,.6g}"
             }
-            
+
         except Exception as e:
             return {
                 "success": False,
                 "error": f"Invalid expression: {str(e)}",
                 "expression": expression
             }
-    
+
+    def _safe_eval_ast(self, node, allowed_names):
+        """Recursively evaluate AST nodes safely"""
+
+        if isinstance(node, ast.Num):  # e.g., 3, 4.5
+            return node.n
+        elif isinstance(node, ast.Constant):  # Python 3.8+
+            if isinstance(node.value, (int, float)):
+                return node.value
+            raise ValueError("Only numeric constants are allowed")
+
+        elif isinstance(node, ast.BinOp):  # e.g., a + b
+            left = self._safe_eval_ast(node.left, allowed_names)
+            right = self._safe_eval_ast(node.right, allowed_names)
+
+            if isinstance(node.op, ast.Add): return left + right
+            elif isinstance(node.op, ast.Sub): return left - right
+            elif isinstance(node.op, ast.Mult): return left * right
+            elif isinstance(node.op, ast.Div): return left / right
+            elif isinstance(node.op, ast.FloorDiv): return left // right
+            elif isinstance(node.op, ast.Mod): return left % right
+            elif isinstance(node.op, ast.Pow): return left ** right
+            else:
+                raise ValueError(f"Unsupported operator: {ast.dump(node.op)}")
+
+        elif isinstance(node, ast.UnaryOp):  # e.g., -a
+            operand = self._safe_eval_ast(node.operand, allowed_names)
+            if isinstance(node.op, ast.UAdd): return +operand
+            elif isinstance(node.op, ast.USub): return -operand
+            else:
+                raise ValueError(f"Unsupported unary operator: {ast.dump(node.op)}")
+
+        elif isinstance(node, ast.Call):  # e.g., sin(x)
+            if not isinstance(node.func, ast.Name):
+                raise ValueError("Only named functions are allowed")
+            func_name = node.func.id
+            if func_name not in allowed_names:
+                raise ValueError(f"Function '{func_name}' is not allowed")
+
+            args = [self._safe_eval_ast(arg, allowed_names) for arg in node.args]
+            return allowed_names[func_name](*args)
+
+        elif isinstance(node, ast.Name):  # e.g., pi, e
+            if node.id in allowed_names:
+                return allowed_names[node.id]
+            raise ValueError(f"Use of unknown variable '{node.id}'")
+
+        else:
+            raise ValueError(f"Unsupported expression element: {ast.dump(node)}")
+
     async def _perform_operation(self, operation: str, numbers: List[float]) -> Dict[str, Any]:
         """Perform statistical operations"""
         
@@ -126,14 +167,14 @@ class CalculatorTool(BaseTool):
         
         try:
             operations_map = {
-                "mean": lambda x: statistics.mean(x),
-                "median": lambda x: statistics.median(x),
-                "mode": lambda x: statistics.mode(x),
+                "mean": statistics.mean,
+                "median": statistics.median,
+                "mode": statistics.mode,
                 "stdev": lambda x: statistics.stdev(x) if len(x) > 1 else 0,
                 "variance": lambda x: statistics.variance(x) if len(x) > 1 else 0,
-                "sum": lambda x: sum(x),
-                "min": lambda x: min(x),
-                "max": lambda x: max(x)
+                "sum": sum,
+                "min": min,
+                "max": max
             }
             
             if operation in operations_map:
