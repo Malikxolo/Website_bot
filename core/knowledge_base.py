@@ -70,7 +70,10 @@ class KnowledgeBaseManager:
     
     def _get_namespaced_collection_name(self, user_id: str, collection_name: str) -> str:
         """Create user-namespaced collection name to prevent cross-user contamination"""
-        return f"{user_id}_{collection_name}"
+        # Sanitize user_id by replacing / with _ for ChromaDB compatibility
+        safe_user_id = user_id.replace("/", "_")
+        return f"{safe_user_id}_{collection_name}"
+
     
     def create_user_knowledge_base(
         self, 
