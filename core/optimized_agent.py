@@ -189,6 +189,11 @@ class OptimizedAgent:
         logger.info(f"   User ID: {user_id}")
         logger.info(f"   Is None?: {chat_history is None}")
         
+        # Initialize variables that are used later in all code paths
+        cached_analysis = None
+        analysis = None
+        analysis_time = 0.0
+        
         try:
             # STEP 1: Check if pending confirmation exists for this user
             pending = None
@@ -1151,7 +1156,28 @@ Return ONLY valid JSON:
         "tone": "friendly|professional|empathetic|excited"
     }},
     "key_points_to_address": ["point1", "point2"]
-}}"""
+}}
+
+CRITICAL INSTRUCTIONS:
+1. If PENDING ACTION exists in context above:
+   - You MUST include "confirmation_response" in your JSON response
+   - Set "has_pending": true
+   - Analyze user's message to determine their intent regarding the pending action
+   - Consider:
+     * Semantic meaning (what do they REALLY want?)
+     * Emotional state (frustrated? urgent? casual?)
+     * Context awareness (urgency + heavy operation = decline)
+     * Language/culture (Hindi/Hinglish slang, casual speech)
+   - Set confidence HIGH (80-100) for clear cases, MEDIUM (50-79) for somewhat clear, LOW (<50) for ambiguous
+
+2. If NO PENDING ACTION exists in context:
+   - Set "has_pending": false
+   - Set "user_intent": "new_query"
+   - Set "confidence": 100
+   - Set "reasoning": "No pending action exists"
+
+3. Remember: When user shows URGENCY + pending action is SLOW → they want FAST answer = DECLINE
+"""
 
         try:
             messages = []
