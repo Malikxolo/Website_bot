@@ -25,7 +25,10 @@ from .config import (
     ENABLE_SCRAPING_CONFIRMATION,
     SCRAPING_CONFIRMATION_THRESHOLD,
     ESTIMATED_TIME_PER_PAGE,
-    ENABLE_SUPERSEDE_ON_NEW_QUERY
+    ENABLE_SUPERSEDE_ON_NEW_QUERY,
+    ENABLE_LLM_CONFIRMATION_DETECTION,
+    LLM_CONFIRMATION_CONFIDENCE_THRESHOLD,
+    ENABLE_CONFIRMATION_REGEX_FALLBACK
 )
 
 config = MemoryConfig(
@@ -187,77 +190,110 @@ class OptimizedAgent:
         logger.info(f"   Is None?: {chat_history is None}")
         
         try:
-            # STEP 1: Check if this is a confirmation reply (yes/no)
-            confirmation_reply = self._is_confirmation_reply(query)
-            
-            if confirmation_reply and user_id:
-                logger.info(f"🔍 Detected confirmation reply: '{confirmation_reply}'")
-                
-                # Check for pending confirmation
+            # STEP 1: Check if pending confirmation exists for this user
+            pending = None
+            if user_id and ENABLE_SCRAPING_CONFIRMATION:
                 pending = await self.cache_manager.get_pending_confirmation_for_user(user_id)
+            
+            # STEP 2: Determine if this is a confirmation reply using LLM (if pending exists)
+            if pending and ENABLE_LLM_CONFIRMATION_DETECTION:
+                logger.info(f"⏳ Pending confirmation found - analyzing intent with LLM")
                 
-                if pending:
-                    logger.info(f"✅ Found pending confirmation for user {user_id}")
-                    token = pending.get('token')
-                    
-                    # Delete the pending confirmation
-                    await self.cache_manager.delete_pending_confirmation(token)
-                    
-                    if confirmation_reply == 'yes':
-                        # User approved - continue with original scraping guidance
-                        logger.info(f"👍 User approved high scraping - proceeding")
-                        
-                        return await self._resume_with_confirmation(
-                            pending=pending,
-                            user_decision='yes',
-                            start_time=start_time
-                        )
-                    
-                    elif confirmation_reply == 'no':
-                        # User declined - downgrade to low scraping
-                        logger.info(f"👎 User declined high scraping - downgrading to low (1 page)")
-                        
-                        return await self._resume_with_confirmation(
-                            pending=pending,
-                            user_decision='no',
-                            start_time=start_time
-                        )
-                else:
-                    logger.info(f"⚠️ No pending confirmation found - treating as normal query")
-                    # Fall through to normal processing
-            
-            # STEP 1.5: If NOT a confirmation reply and user has pending confirmations, cancel them
-            elif not confirmation_reply and user_id and ENABLE_SUPERSEDE_ON_NEW_QUERY:
-                cancelled_count = await self.cache_manager.cancel_all_pending_confirmations_for_user(user_id)
-                if cancelled_count > 0:
-                    logger.info(f"🔻 Auto-cancelled {cancelled_count} pending confirmation(s) - user sent new query: '{query[:50]}...'")
-            
-            # Check cache first
-            cached_analysis = await self.cache_manager.get_cached_query(query, user_id)
-            
-            if cached_analysis:
-                logger.info(f"🎯 USING CACHED ANALYSIS - Skipping Brain LLM call")
-                analysis = cached_analysis
-                analysis_time = 0.0  # Cache hit = instant
-            else:
-                # Retrieve memories
+                # Retrieve memories for context
                 memory_results = await self.memory.search(query, user_id=user_id, limit=5)
                 memories = "\n".join([
                     f"- {item['memory']}" 
                     for item in memory_results.get("results", []) 
                     if item.get("memory")
                 ]) or "No previous context."
+                
+                # Call Brain LLM with pending confirmation context
+                analysis = await self._comprehensive_analysis(
+                    query=query,
+                    chat_history=chat_history,
+                    memories=memories,
+                    pending_confirmation=pending
+                )
+                
+                # Extract confirmation response from LLM
+                confirmation_response = analysis.get('confirmation_response', {})
+                has_pending = confirmation_response.get('has_pending', False)
+                user_intent = confirmation_response.get('user_intent', 'new_query')
+                confidence = confirmation_response.get('confidence', 0)
+                reasoning = confirmation_response.get('reasoning', 'No reasoning provided')
+                
+                logger.info(f"🎯 LLM Confirmation Analysis:")
+                logger.info(f"   Has Pending: {has_pending}")
+                logger.info(f"   User Intent: {user_intent}")
+                logger.info(f"   Confidence: {confidence}%")
+                logger.info(f"   Reasoning: {reasoning}")
+                
+                # Route based on LLM semantic analysis
+                if has_pending and user_intent == 'approve':
+                    # User approved - proceed with full scraping
+                    logger.info(f"✅ User approved (confidence: {confidence}%) - proceeding with full scraping")
+                    token = pending.get('token')
+                    await self.cache_manager.delete_pending_confirmation(token)
+                    
+                    return await self._resume_with_confirmation(
+                        pending=pending,
+                        user_decision='yes',
+                        start_time=start_time
+                    )
+                
+                elif has_pending and user_intent == 'decline':
+                    # User declined - downgrade scraping
+                    logger.info(f"� LLM detected decline (confidence: {confidence}%) - downgrading to minimal scraping")
+                    token = pending.get('token')
+                    await self.cache_manager.delete_pending_confirmation(token)
+                    
+                    return await self._resume_with_confirmation(
+                        pending=pending,
+                        user_decision='no',
+                        start_time=start_time
+                    )
+                
+                elif user_intent == 'new_query' or user_intent == 'ambiguous':
+                    # User changed topic or intent unclear - cancel pending and process new query
+                    logger.info(f"🔄 User intent: {user_intent} (confidence: {confidence}%) - cancelling pending and processing as new query")
+                    await self.cache_manager.cancel_all_pending_confirmations_for_user(user_id)
+                    # Fall through to normal processing with existing analysis
+                
+                # If we reached here, we have analysis from LLM - use it
+                logger.info(f"📊 Using LLM analysis from confirmation check")
+                analysis_time = 0.0  # Already analyzed above
+                
+            else:
+                # No pending confirmation - proceed normally
+                analysis = None
+            
+            # STEP 3: If no analysis yet (no pending or didn't use LLM path), check cache or analyze
+            if analysis is None:
+                cached_analysis = await self.cache_manager.get_cached_query(query, user_id)
+                
+                if cached_analysis:
+                    logger.info(f"🎯 USING CACHED ANALYSIS - Skipping Brain LLM call")
+                    analysis = cached_analysis
+                    analysis_time = 0.0  # Cache hit = instant
+                else:
+                    # Retrieve memories
+                    memory_results = await self.memory.search(query, user_id=user_id, limit=5)
+                    memories = "\n".join([
+                        f"- {item['memory']}" 
+                        for item in memory_results.get("results", []) 
+                        if item.get("memory")
+                    ]) or "No previous context."
 
-                logger.info(f" Retrieved memories: {memories}")
-                analysis_start = datetime.now()
-                
-                # Perform analysis
-                analysis = await self._comprehensive_analysis(query, chat_history, memories)
-                analysis_time = (datetime.now() - analysis_start).total_seconds()
-                logger.info(f" Analysis completed in {analysis_time:.2f}s")
-                
-                # Cache the analysis
-                await self.cache_manager.cache_query(query, analysis, user_id, ttl=3600)
+                    logger.info(f" Retrieved memories: {memories}")
+                    analysis_start = datetime.now()
+                    
+                    # Perform analysis
+                    analysis = await self._comprehensive_analysis(query, chat_history, memories)
+                    analysis_time = (datetime.now() - analysis_start).total_seconds()
+                    logger.info(f" Analysis completed in {analysis_time:.2f}s")
+                    
+                    # Cache the analysis
+                    await self.cache_manager.cache_query(query, analysis, user_id, ttl=3600)
             
             # LOG: Enhanced analysis results
             logger.info(f" ANALYSIS RESULTS:")
@@ -650,7 +686,7 @@ class OptimizedAgent:
         
         return guides.get(emotion, {}).get(intensity, "Be naturally helpful and friendly")
 
-    async def _comprehensive_analysis(self, query: str, chat_history: List[Dict] = None, memories:str = "") -> Dict[str, Any]:
+    async def _comprehensive_analysis(self, query: str, chat_history: List[Dict] = None, memories:str = "", pending_confirmation: Optional[Dict] = None) -> Dict[str, Any]:
         """Single LLM call for ALL analysis needs"""
         logger.info(f" ANALYSIS DEBUG:")
         logger.info(f"   Chat History Type: {type(chat_history)}")
@@ -661,6 +697,25 @@ class OptimizedAgent:
         context = chat_history[-2:] if chat_history else []
         logger.info(f"   Built Context: '{context}'")
         
+        # Extract pending confirmation data if exists (for context section)
+        pending_info = None
+        if pending_confirmation:
+            pending_info = {
+                'query': pending_confirmation.get('payload', {}).get('query', ''),
+                'estimated_time': pending_confirmation.get('payload', {}).get('estimated_time_secs', 0),
+                'total_pages': pending_confirmation.get('payload', {}).get('total_pages', 0)
+            }
+            logger.info(f"📋 Pending confirmation detected: {pending_info['query'][:50]}...")
+        
+        # Build pending context string for main prompt
+        pending_context = ""
+        if pending_info:
+            pending_context = f"""
+PENDING ACTION AWAITING USER RESPONSE:
+- Original Query: "{pending_info['query']}"
+- Action Required: Scrape {pending_info['total_pages']} pages (~{pending_info['estimated_time']} seconds)
+- System Asked: "Would you like to continue? (yes/no)"
+"""
         
         # Create comprehensive prompt that does everything in one shot
         analysis_prompt = f"""You are analyzing queries for Mochan-D - an AI chatbot solution that:
@@ -671,6 +726,7 @@ class OptimizedAgent:
 
 LONG-TERM CONTEXT (Memories): {memories}
 RECENT CONVERSATION: {context}
+{pending_context}
 USER QUERY: {query}
 
 AVAILABLE TOOLS:
@@ -700,10 +756,48 @@ Perform ALL of the following analyses in ONE response:
      * "iPhone 16 price and Samsung S24 price" → 2 tasks: [iPhone pricing, Samsung pricing]
      * "Compare our product with competitors" → 1 task: [product comparison]
 
-2. SEMANTIC INTENT (overall user goal)
-   - Based on the decomposed tasks, what is the user's ultimate goal?
-   - Synthesize the sub-tasks into a comprehensive understanding of what they want to achieve
-   - Include every specific number, measurement, name, date, and technical detail from the user's query
+2. SEMANTIC INTENT ANALYSIS:
+   
+   A. Understand the user's TRUE goal:
+      - What do they actually want to achieve?
+      - Consider their emotional state (urgent? frustrated? casual?)
+      - What's the REAL intent behind their words?
+   
+   B. If there is a PENDING ACTION (check PENDING ACTION context above):
+      Determine how the current message relates to the pending action:
+      
+      - APPROVAL: User wants to proceed with the pending action
+        Indicators: Agreement, confirmation, go-ahead signals
+        Examples: "yes", "okay", "continue", "do it", "haan", "chalo", "kar do"
+        
+      - DECLINE: User does NOT want to proceed with the pending action
+        Indicators: Rejection, urgency for quick answer, frustration with wait time
+        Examples: 
+          - Direct rejection: "no", "cancel", "skip", "nahi", "mat karo", "rehne do"
+          - Urgency-based decline: "I need answer quickly", "no time to wait", "jldi chahiye", "fast chahiye"
+          - Implicit decline: User expresses frustration/urgency AND pending action is slow/heavy
+        
+        ⚠️ CRITICAL INSIGHT FOR DECLINE:
+        When user expresses URGENCY while a SLOW/HEAVY pending action exists:
+        → This means they want FAST answer, NOT the slow operation
+        → Interpret as DECLINE, not approval
+        
+        Real Example: "ni bhai jldi chahiye" (no brother, need quickly)
+        → "ni" = no/negation + "jldi" = urgency/quickly
+        → User is saying: NO to slow scraping, I need answer QUICKLY
+        → Result: DECLINE (confidence: 90%+)
+        
+      - NEW_QUERY: User is asking something completely different, ignoring pending action
+        Indicators: Topic change, unrelated question, moving on to new subject
+        Examples: "what is Python?", "tell me about AI", any question about different topic
+        
+      - AMBIGUOUS: Intent is unclear, mixed signals, needs clarification
+        Examples: "maybe", "hmm", "idk", "yes but can you show me something else"
+   
+   C. Synthesize understanding:
+      - Based on decomposed tasks (from step 1), what is the user's ultimate goal?
+      - Include every specific number, measurement, name, date, and technical detail from the query
+      - Consider emotional cues, urgency signals, and conversation context
 
 3. MOCHAN-D PRODUCT OPPORTUNITY ANALYSIS:
    Does the user's query relate to problems that Mochan-D's AI chatbot solution can solve?
@@ -878,6 +972,64 @@ Perform ALL of the following analyses in ONE response:
     - Calculator: Extract numbers from sub-task, create valid Python expression
     - Web_search: Transform sub-task into focused search query, preserve qualifiers (when, how much, what type), add "2025" if time-sensitive
 
+9. CONFIRMATION RESPONSE ANALYSIS:
+
+   Check if there is a PENDING ACTION in the context above (look for "PENDING ACTION AWAITING USER RESPONSE" section).
+   
+   If PENDING ACTION EXISTS:
+   - You MUST analyze the user's message to determine their intent regarding the pending action
+   - Include "confirmation_response" in your JSON response with:
+     * "has_pending": true
+     * "user_intent": One of the following based on semantic analysis
+     * "confidence": 0-100 (how certain you are)
+     * "reasoning": Brief explanation of your decision
+   
+   USER INTENT TYPES:
+   
+   a) "approve" - User wants to proceed with the pending action
+      Indicators: Agreement, confirmation, go-ahead signals
+      Examples: "yes", "okay", "continue", "do it", "haan", "chalo", "kar do", "theek hai"
+   
+   b) "decline" - User does NOT want to proceed with the pending action
+      Indicators: 
+      - Direct rejection: "no", "cancel", "skip", "nahi", "mat karo", "rehne do"
+      - Urgency-based decline: "need answer quickly", "no time", "jldi chahiye", "fast chahiye"
+      - Implicit decline: User expresses frustration/urgency AND pending action is slow/heavy
+      
+      ⚠️ CRITICAL INSIGHT FOR DECLINE:
+      When user expresses URGENCY while a SLOW/HEAVY pending action exists:
+      → This means they want FAST answer, NOT the slow operation
+      → Interpret as DECLINE, not approval
+      
+      Real-world example: "ni bhai jldi chahiye" (no brother, need quickly)
+      Analysis: "ni" = no/negation + "jldi" = urgency/quickly
+      Meaning: User is saying NO to slow scraping, wants answer QUICKLY
+      Result: DECLINE (high confidence: 90%+)
+   
+   c) "new_query" - User is asking something completely different, ignoring the pending action
+      Indicators: Topic change, unrelated question, moving to new subject
+      Examples: "what is Python?", "tell me about AI", asking about different topic
+   
+   d) "ambiguous" - Intent is unclear, mixed signals, needs clarification
+      Examples: "maybe", "hmm", "idk", "yes but show me something else"
+   
+   ANALYSIS GUIDELINES:
+   - Consider semantic meaning (what do they REALLY want?)
+   - Consider emotional state (frustrated? urgent? casual?)
+   - Consider context awareness (urgency + heavy operation = decline)
+   - Consider language/culture (Hindi/Hinglish slang, casual speech)
+   - Set confidence HIGH (80-100) for clear cases
+   - Set confidence MEDIUM (50-79) for somewhat clear
+   - Set confidence LOW (<50) for ambiguous
+   
+   If NO PENDING ACTION EXISTS:
+   - Set "has_pending": false
+   - Set "user_intent": "new_query"
+   - Set "confidence": 100
+   - Set "reasoning": "No pending action exists"
+   
+   REMEMBER: When user shows URGENCY + pending action is SLOW → they want FAST answer = DECLINE
+
     EXAMPLES OF MULTI-TASK HANDLING:
 
     Example 1 - Multi-task Parallel (Independent tasks):
@@ -949,6 +1101,12 @@ Return ONLY valid JSON:
         "sub_tasks": ["description of task 1", "description of task 2"]
     }},
     "semantic_intent": "clear description of overall user goal",
+    "confirmation_response": {{
+        "has_pending": true/false,
+        "user_intent": "approve|decline|new_query|ambiguous",
+        "confidence": 0-100,
+        "reasoning": "Brief explanation based on semantic analysis of user's TRUE intent"
+    }},
     "business_opportunity": {{
         "detected": true/false,
         "composite_confidence": 0-100,

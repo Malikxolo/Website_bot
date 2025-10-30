@@ -35,10 +35,13 @@ SCRAPING_CONFIRMATION_THRESHOLD = 3  # Ask confirmation for medium (3) and high 
 ENABLE_SCRAPING_GUIDANCE = True
 ENABLE_SCRAPING_CONFIRMATION = True  # Enable/disable confirmation flow
 ENABLE_SUPERSEDE_ON_NEW_QUERY = True  # Auto-cancel pending confirmations when user sends new non-confirmation query
+ENABLE_LLM_CONFIRMATION_DETECTION = True  # Use LLM for semantic confirmation intent detection
+ENABLE_CONFIRMATION_REGEX_FALLBACK = True  # Use regex fallback when LLM confidence is low
 
 # Confirmation settings
 SCRAPING_CONFIRMATION_TTL = 300  # 5 minutes for pending confirmations
 ESTIMATED_TIME_PER_PAGE = 5  # Seconds per page scraped (approximate)
+LLM_CONFIRMATION_CONFIDENCE_THRESHOLD = 70  # Minimum confidence to trust LLM intent detection
 
 @dataclass
 class AddBackgroundTask:
