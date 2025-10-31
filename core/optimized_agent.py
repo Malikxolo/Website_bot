@@ -856,39 +856,8 @@ Perform ALL of the following analyses in ONE response:
       - What do they actually want to achieve?
       - Consider their emotional state (urgent? frustrated? casual?)
       - What's the REAL intent behind their words?
-   
-   B. If there is a PENDING ACTION (check PENDING ACTION context above):
-      Determine how the current message relates to the pending action:
       
-      - APPROVAL: User wants to proceed with the pending action
-        Indicators: Agreement, confirmation, go-ahead signals
-        Examples: "yes", "okay", "continue", "do it", "haan", "chalo", "kar do"
-        
-      - DECLINE: User does NOT want to proceed with the pending action
-        Indicators: Rejection, urgency for quick answer, frustration with wait time
-        Examples: 
-          - Direct rejection: "no", "cancel", "skip", "nahi", "mat karo", "rehne do"
-          - Urgency-based decline: "I need answer quickly", "no time to wait", "jldi chahiye", "fast chahiye"
-          - Implicit decline: User expresses frustration/urgency AND pending action is slow/heavy
-        
-        ⚠️ CRITICAL INSIGHT FOR DECLINE:
-        When user expresses URGENCY while a SLOW/HEAVY pending action exists:
-        → This means they want FAST answer, NOT the slow operation
-        → Interpret as DECLINE, not approval
-        
-        Real Example: "ni bhai jldi chahiye" (no brother, need quickly)
-        → "ni" = no/negation + "jldi" = urgency/quickly
-        → User is saying: NO to slow scraping, I need answer QUICKLY
-        → Result: DECLINE (confidence: 90%+)
-        
-      - NEW_QUERY: User is asking something completely different, ignoring pending action
-        Indicators: Topic change, unrelated question, moving on to new subject
-        Examples: "what is Python?", "tell me about AI", any question about different topic
-        
-      - AMBIGUOUS: Intent is unclear, mixed signals, needs clarification
-        Examples: "maybe", "hmm", "idk", "yes but can you show me something else"
-   
-   C. Synthesize understanding:
+   B. Synthesize understanding:
       - Based on decomposed tasks (from step 1), what is the user's ultimate goal?
       - Include every specific number, measurement, name, date, and technical detail from the query
       - Consider emotional cues, urgency signals, and conversation context
@@ -1066,49 +1035,36 @@ Perform ALL of the following analyses in ONE response:
     - Calculator: Extract numbers from sub-task, create valid Python expression
     - Web_search: Transform sub-task into focused search query, preserve qualifiers (when, how much, what type), add "2025" if time-sensitive
 
- 9. CONFIRMATION RESPONSE ANALYSIS:
+9. CONFIRMATION RESPONSE ANALYSIS:
 
    Check if there is a PENDING ACTION in the context above.
    
    If PENDING ACTION EXISTS:
    
-   Understand the semantic meaning of the user's message in relation to the pending action.
+   The system asked: "Would you like to continue? (yes/no)"
    
-   Ask yourself: "What does the user REALLY want to do?"
+   Identify the SUBJECT of the user's message:
    
-   Classify user intent as:
+   What is the user's message ABOUT?
+   What is the user REFERRING to?
    
-   "approve" - User consents to proceed with the pending action
-   → They agree, want to continue, willing to wait
+   If the message is ABOUT the pending action (answering the yes/no question):
+   → Classify based on their answer:
+      - Affirmative answer → "approve"
+      - Negative answer or urgency for fast alternative → "decline"
    
-   "decline" - User rejects the pending action
-   → They explicitly refuse (negation words present)
-   → OR they express urgency/speed need while pending action is slow/heavy
-   → Key insight: urgency + slow operation = they want fast answer, NOT slow operation
+   If the message is NOT about the pending action:
+   → Classify as "new_query"
+   → This includes: statements about other things, new questions, comments not related to the pending action
    
-   "new_query" - User is talking about something completely different
-   → Topic changed, no relation to pending action
-   → Includes casual conversation, status questions, friendly chitchat
-   → User is ignoring the confirmation request
+   Set confidence 0-100 based on clarity of subject identification.
    
-   "ambiguous" - Intent is unclear, mixed signals
-   
-   CRITICAL DISTINCTION:
-   Casual questions about process/status = "new_query" (NOT decline)
-   Actual rejection with negation/urgency = "decline"
-   
-   Set confidence 0-100 based on signal clarity:
-   - 80-100: Very clear intent
-   - 50-79: Somewhat clear
-   - 0-49: Unclear, ambiguous
-   
-   Provide brief reasoning explaining your semantic analysis.
+   Reasoning: State what the subject of the message is and whether it refers to the pending action.
    
    If NO PENDING ACTION EXISTS:
-   - Set "has_pending": false
-   - Set "user_intent": "new_query"
-   - Set "confidence": 100
-   - Set "reasoning": "No pending action exists"
+   - has_pending: false
+   - user_intent: "new_query"
+   - confidence: 100
 
     EXAMPLES OF MULTI-TASK HANDLING:
 
@@ -1231,28 +1187,7 @@ Return ONLY valid JSON:
         "tone": "friendly|professional|empathetic|excited"
     }},
     "key_points_to_address": ["point1", "point2"]
-}}
-
-CRITICAL INSTRUCTIONS:
-1. If PENDING ACTION exists in context above:
-   - You MUST include "confirmation_response" in your JSON response
-   - Set "has_pending": true
-   - Analyze user's message to determine their intent regarding the pending action
-   - Consider:
-     * Semantic meaning (what do they REALLY want?)
-     * Emotional state (frustrated? urgent? casual?)
-     * Context awareness (urgency + heavy operation = decline)
-     * Language/culture (Hindi/Hinglish slang, casual speech)
-   - Set confidence HIGH (80-100) for clear cases, MEDIUM (50-79) for somewhat clear, LOW (<50) for ambiguous
-
-2. If NO PENDING ACTION exists in context:
-   - Set "has_pending": false
-   - Set "user_intent": "new_query"
-   - Set "confidence": 100
-   - Set "reasoning": "No pending action exists"
-
-3. Remember: When user shows URGENCY + pending action is SLOW → they want FAST answer = DECLINE
-"""
+}}"""
 
         try:
             messages = []
@@ -1678,6 +1613,15 @@ Business Mode (Smart Consultant): Maintains friendly tone + strategic depth, spo
         - User Emotion: {sentiment.get('primary_emotion', 'casual')} ({sentiment.get('intensity', 'medium')})
         - User Sentiment Guide: {sentiment_guidance}
 
+        DATA AUTHORITY CONTEXT:
+
+        When data is presented as WEB_SEARCH or RAG results:
+        - This represents CURRENT REALITY (not training memory)
+        - This is what exists in the world RIGHT NOW
+        - Your training knowledge is a backup reference only
+
+        Build your response using the tool data as your source of truth
+        
         AVAILABLE DATA TO USE NATURALLY:
         {tool_data}
 
