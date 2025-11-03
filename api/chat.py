@@ -27,6 +27,7 @@ from core.knowledge_base import (
     set_collection_cache,
     get_org_cache,
     get_collection_cache,
+    embedding_functions,
     kb_manager
 )
 
@@ -107,11 +108,18 @@ async def lifespan(app: FastAPI):
         host=os.getenv('CHROMA_HOST', 'http://localhost:8000'),
         port=int(os.getenv('CHROMA_PORT', '8000'))
     )
+    
+    embedding_function = embedding_functions.OpenAIEmbeddingFunction(
+        api_key=os.getenv('OPENAI_API_KEY'),
+        model_name=os.getenv('EMBEDDING_MODEL', 'text-embedding-3-small')
+    )
+    
     kb_manager = initialize_kb_manager(
         chroma_client=chroma_client,
         mongo_client=mongo_client,
         org_manager=org_manager,
         redis_client=redis_client,
+        embedding_function=embedding_function,
         database_name="knowledge_base"
     )
     await kb_manager.create_global_collection()
