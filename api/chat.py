@@ -157,6 +157,7 @@ class ChatMessage(BaseModel):
     userid: str
     chat_history: list[dict] = []
     user_query: str
+    mode: Optional[str] = None
     
 from .global_config import settings
 
@@ -208,6 +209,7 @@ async def chat_brain_heart_system(request: ChatMessage = Body(...)):
         user_id = request.userid
         user_query = request.user_query
         chat_history = request.chat_history[-4:] if hasattr(request, 'chat_history') and request.chat_history else []
+        mode = request.mode if hasattr(request, 'mode') else None
         
         safe_log_user_data(user_id, 'brain_heart_chat', message_count=len(user_query))
         
@@ -251,7 +253,7 @@ async def chat_brain_heart_system(request: ChatMessage = Body(...)):
             tool_manager
         )
         
-        result = await optimizedAgent.process_query(user_query, chat_history, user_id)
+        result = await optimizedAgent.process_query(user_query, chat_history, user_id, mode)
         
         if result["success"]:
             safe_log_response(result, level='info')
