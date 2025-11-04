@@ -919,19 +919,22 @@ Perform ALL of the following analyses in ONE response:
 
    For EACH sub-task identified in step 1, select the most appropriate tool:
    
-   RAG SELECTION (STRICT RULE):
-   Select `rag` for a sub-task if EITHER:
-   1. The sub-task is directly ABOUT Mochan-D (mentions "Mochan-D", "our/your product", "this chatbot", etc.)
-   2. OR business_opportunity.detected = true for that sub-task
-
    GENERAL TOOL SELECTION:
    - `web_search`: For current information, prices, comparisons, weather, news, etc.
    - `calculator`: For mathematical calculations, statistical operations
    
+    AFTER SELECTING ALL GENERAL TOOLS - APPLY RAG SELECTION (GLOBAL CHECK):
+    Select `rag` if ANY of:
+    1. Any sub-task is directly ABOUT Mochan-D
+    2. OR business_opportunity.detected = true
+    3. OR web_search is selected for ANY sub-task
+    
+    If rag should be added, add ONE `rag` to tools_to_use
+ 
    IMPORTANT: The `tools_to_use` array should contain one tool for each sub-task.
-   - If you have 2 sub-tasks needing web_search, include ["web_search", "web_search"]
-   - If you have 1 sub-task needing web_search and 1 needing calculator, include ["web_search", "calculator"]
-   
+   - If you have 2 sub-tasks needing web_search, include ["web_search", "web_search", "rag"]
+   - If you have 1 sub-task needing web_search and 1 needing calculator, include ["web_search", "calculator", "rag"]
+
    Use NO tools for:
    - Greetings, casual chat
    - General knowledge questions that don't require current information
@@ -952,26 +955,33 @@ Perform ALL of the following analyses in ONE response:
    - "low" (1 page): Simple factual queries, quick lookups, single-source answers
      Examples: "what is capital of France", "current time", "definition of X"
    
+   - "medium" (3 pages): Comparison queries, multi-source verification, moderate depth
+     Examples: "compare iPhone vs Samsung", "best restaurants in Lucknow", "product reviews"
+   
    - "high" (5 pages): Complex research, comprehensive analysis, multi-faceted queries
      Examples: "analyze market trends", "competitive landscape", "in-depth technical comparison"
    
    DECISION RULES:
-   1. Query complexity: Simple fact → low, Research → high
-   2. Expected answer breadth: Single point → low, Comprehensive → high
-   3. Verification needs: No verification → low, Thorough validation → high
+   1. Query complexity: Simple fact → low, Comparison → medium, Research → high
+   2. Expected answer breadth: Single point → low, Multiple points → medium, Comprehensive → high
+   3. Verification needs: No verification → low, Cross-check → medium, Thorough validation → high
    
    For EACH web_search tool in tools_to_use, provide scraping guidance:
-   - Set `scraping_level`: "low", or "high"
-   - Set `scraping_count`: corresponding number (1 or 5)
+   - Set `scraping_level`: "low", "medium", or "high"
+   - Set `scraping_count`: corresponding number (1, 3, or 5)
    - Include brief `scraping_reason`: why this level is appropriate
    
    If NO web_search tool is used, omit scraping_guidance entirely.
    
-   IMPORTANT: For indexed tools (web_search_0), provide guidance for EACH:
+   IMPORTANT: For indexed tools (web_search_0, web_search_1), provide guidance for EACH:
    {{
      "scraping_guidance": {{
-       
        "web_search_0": {{
+         "scraping_level": "medium",
+         "scraping_count": 3,
+         "scraping_reason": "Comparison query requires multiple sources"
+       }},
+       "web_search_1": {{
          "scraping_level": "low",
          "scraping_count": 1,
          "scraping_reason": "Simple factual lookup"
@@ -1151,8 +1161,8 @@ Return ONLY valid JSON:
     }},
     "scraping_guidance": {{
         "web_search_0": {{
-            "scraping_level": "low|high",
-            "scraping_count": 1|5,
+            "scraping_level": "low|medium|high",
+            "scraping_count": 1|3|5,
             "scraping_reason": "why this level"
         }}
     }},
@@ -1297,8 +1307,8 @@ Return ONLY valid JSON:
                 scrape_count = None
                 if tool == 'web_search' and indexed_key in scraping_guidance:
                     guidance = scraping_guidance[indexed_key]
-                    scrape_count = guidance.get('scraping_count', 1)
-                    scraping_level = guidance.get('scraping_level', 'low')
+                    scrape_count = guidance.get('scraping_count', 3)
+                    scraping_level = guidance.get('scraping_level', 'medium')
                     logger.info(f"   📊 Scraping: {scraping_level} level ({scrape_count} pages)")
                     logger.info(f"   📋 Reason: {guidance.get('scraping_reason', 'N/A')}")
                 
@@ -1350,8 +1360,8 @@ Return ONLY valid JSON:
         first_tool_kwargs = {"query": first_query, "user_id": user_id}
         if first_tool_name == 'web_search' and first_tool_key in scraping_guidance:
             guidance = scraping_guidance[first_tool_key]
-            scrape_count = guidance.get('scraping_count', 1)
-            scraping_level = guidance.get('scraping_level', 'low')
+            scrape_count = guidance.get('scraping_count', 3)
+            scraping_level = guidance.get('scraping_level', 'medium')
             first_tool_kwargs["scrape_top"] = scrape_count
             logger.info(f"      Scraping: {scraping_level} level ({scrape_count} pages)")
         
@@ -1390,8 +1400,8 @@ Return ONLY valid JSON:
             current_tool_kwargs = {"query": enhanced_query, "user_id": user_id}
             if current_tool_name == 'web_search' and current_tool_key in scraping_guidance:
                 guidance = scraping_guidance[current_tool_key]
-                scrape_count = guidance.get('scraping_count', 1)
-                scraping_level = guidance.get('scraping_level', 'low')
+                scrape_count = guidance.get('scraping_count', 3)
+                scraping_level = guidance.get('scraping_level', 'medium')
                 current_tool_kwargs["scrape_top"] = scrape_count
                 logger.info(f"      Scraping: {scraping_level} level ({scrape_count} pages)")
             
@@ -1603,6 +1613,8 @@ Business Mode (Smart Consultant): Maintains friendly tone + strategic depth, spo
 
         Build your response using the tool data as your source of truth
         
+        TASK: When the user's query is an explicit action (summarize, extract, analyze, compare), DO THAT TASK using the available data. Don't ask for clarification on what to do - do it naturally.
+        
         AVAILABLE DATA TO USE NATURALLY:
         {tool_data}
 
@@ -1684,7 +1696,7 @@ Business Mode (Smart Consultant): Maintains friendly tone + strategic depth, spo
                 messages,
                 temperature=0.4,
                 max_tokens=4000,
-                system_prompt="You are Mochand Dost - conversational AI. If business opportunity exists, naturally pitch Mochan-D. Always natural conversation - NEVER JSON/analysis/structured data. Warm and helpful."
+                system_prompt="You are Mochand Dost. Answer the user's query using the provided data. Don't ask for clarification if data is given. Be warm, natural, conversational - NEVER JSON/structured data."
             )
             
             # LOG: Raw response from Heart LLM
@@ -1839,6 +1851,8 @@ Business Mode (Smart Consultant): Maintains friendly tone + strategic depth, spo
         asyncio.create_task(self.cache_manager.cache_tool_data(tool_results, final_formatted, ttl=7200))
         
         return final_formatted
+
+
     def _extract_recent_phrases(self, chat_history: List[Dict]) -> List[str]:
         """Extract recent phrases to avoid repetition"""
         if not chat_history:
