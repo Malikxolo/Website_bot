@@ -1371,7 +1371,7 @@ Think through each question naturally, then return ONLY the JSON. No other text.
             - Analytical problem-solver who adds real value
             - Structure your responses such that they answer the user's query fully while keeping it short and concise.
             - For complex queries, break down your response into clear sections with headers and bullet points.
-            - Keep your response under 200 characters.
+            - Keep your response under 300 characters.
 
             YOUR PERSONALITY:
 
@@ -1402,6 +1402,8 @@ Think through each question naturally, then return ONLY the JSON. No other text.
             
             AVAILABLE DATA TO USE NATURALLY:
             {tool_data}
+            
+            NOTE: Provide links if web search is used (Use a view friendly format).
             
             CONVERSATION HISTORY: {context}
             LONG-TERM CONTEXT (Memories): {memories}
@@ -1555,7 +1557,7 @@ Think through each question naturally, then return ONLY the JSON. No other text.
                 if result.get('provider') in ['llmlayer', 'perplexity'] and 'llm_response' in result:
                     provider_name = result.get('provider', '').upper()
                     logger.info(f" {provider_name} pre-formatted response detected")
-                    formatted.append(f"{tool.upper()} ({provider_name}):\n{result['llm_response']}\n")
+                    formatted.append(f"{tool.upper()} ({provider_name}):\n{result['llm_response']}\nSupporting Links:{[res["link"] for res in result["results"]]}\n")
                     continue  # Skip scraping logic
                 
                 # Handle RAG-style result

@@ -141,12 +141,13 @@ async def search_llmlayer(query: str, api_key: str, api_url: str) -> str:
                 
                 data = await response.json()
                 answer = data.get("answer", "")
+                sources = data.get("sources", [])
                 
                 if not answer:
                     raise Exception("No answer received from LLMLayer")
                 
                 logger.info(f"✅ LLMLayer search completed: {len(answer)} characters")
-                return answer
+                return {"answer":answer, "sources": sources}
                 
     except Exception as e:
         error_msg = f"LLMLayer search failed: {str(e)}"

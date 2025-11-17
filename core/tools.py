@@ -712,27 +712,19 @@ class WebSearchTool(BaseTool):
         """LLMLayer Search (returns pre-formatted answer, no scraping needed)"""
         
         try:
-            from .web_search_agent import search_llmlayer
-            
             logger.info(f"   🌐 Using LLMLayer...")
             
             response = await search_llmlayer(query, self.llmlayer_key, self.llmlayer_url)
-            
-            results = [{
-                "title": "LLMLayer Search Results",
-                "snippet": response,
-                "link": "",
-                "position": 1
-            }]
+            answer, sources = response.get("answer", ""), response.get("sources", [])
             
             return {
                 "success": True,
                 "query": query,
-                "results": results,
+                "results": sources,
                 "total_results": 1,
                 "scraped_count": 0,
                 "provider": "llmlayer",
-                "llm_response": response  # Pre-formatted response
+                "llm_response": answer
             }
             
         except Exception as e:
