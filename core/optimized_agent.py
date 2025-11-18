@@ -188,8 +188,12 @@ class OptimizedAgent:
                 await self.cache_manager.cache_tool_results(
                     query, tools_to_use, tool_results, user_id, ttl=3600
                 )
-            
+            links = []
             if tool_results:
+                links = [
+                        item.get("link")
+                        for item in tool_results.get("web_search_0", {}).get("results", [])
+                    ]
                 logger.info(f" TOOL RESULTS SUMMARY:")
                 for tool_name, result in tool_results.items():
                     if isinstance(result, dict) and result.get('success'):
@@ -277,10 +281,13 @@ class OptimizedAgent:
             logger.info(f" ANALYSIS CACHE: {'HIT ✅' if cached_analysis else 'MISS ❌'}")
             logger.info(f" ANALYSIS PATH: {analysis_path}")
             
+            formatted_links = "\nSources:\n\n >" + "\n\n >".join(links[:3]) if links else ""
+            
             return {
                 "success": True,
                 "response": final_response,
                 "analysis": analysis,
+                "sources": formatted_links,
                 "tool_results": tool_results,
                 "tools_used": analysis.get('tools_to_use', []),
                 "execution_mode": execution_mode,
@@ -1557,8 +1564,8 @@ Think through each question naturally, then return ONLY the JSON. No other text.
                 if result.get('provider') in ['llmlayer', 'perplexity'] and 'llm_response' in result:
                     provider_name = result.get('provider', '').upper()
                     logger.info(f" {provider_name} pre-formatted response detected")
-                    formatted.append(f"{tool.upper()} ({provider_name}):\n{result['llm_response']}\nSupporting Links:{[res["link"] for res in result["results"]]}\n")
-                    continue  # Skip scraping logic
+                    formatted.append(f"{tool.upper()} ({provider_name}):\n{result['llm_response']}\n")
+                    continue
                 
                 # Handle RAG-style result
                 if "success" in result and result["success"]:
