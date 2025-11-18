@@ -20,26 +20,8 @@ from mem0 import AsyncMemory
 import time
 from functools import partial
 from mem0.configs.base import MemoryConfig
-from .config import AddBackgroundTask
+from .config import AddBackgroundTask, memory_config
 from .redis_manager import RedisCacheManager
-
-config = MemoryConfig(
-    graph_store={
-        "provider": "neo4j",
-        "config": {
-            "url": getenv('NEO4J_URL'),
-            "username": getenv('NEO4J_USER'),
-            "password": getenv('NEO4J_PASSWORD')
-        }
-    },
-    vector_store={
-        "provider": "chroma",
-        "config": {
-            "collection_name": "mem0_collection",
-            "path": ".chromadb"
-        }
-    }
-)
 
 logger = logging.getLogger(__name__)
 
@@ -54,7 +36,7 @@ class OptimizedAgent:
         self.router_llm = router_llm if router_llm else heart_llm
         self.tool_manager = tool_manager
         self.available_tools = tool_manager.get_available_tools()
-        self.memory = AsyncMemory(config)
+        self.memory = AsyncMemory(memory_config)
         self.task_queue: asyncio.Queue["AddBackgroundTask"] = asyncio.Queue()
         self._worker_started = False
         
