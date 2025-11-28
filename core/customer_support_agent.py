@@ -1,8 +1,26 @@
 """
-Optimized Single-Pass Agent System
+Optimized Single-Pass Agent System with Workflow Routing
 Combines semantic analysis, tool execution, and response generation in minimal LLM calls
 Now supports sequential tool execution with middleware for dependent tools
 WITH REDIS CACHING for queries and formatted tool data
+
+WORKFLOW STAGES (follows JSON workflow):
+1. AIIntakeLayer → Initial sentiment analysis and categorization
+2. DeEscalation → Handles frustrated/angry customers with empathy
+3. PreEscalationGathering → Gather info (photo/reason) before escalation
+4. SensitiveTask → Decision: Refund/cancel/personal data?
+5. ComplianceVerification → Fraud check + image analysis for sensitive operations
+6. SecureHandlingTeam → Human handles verified sensitive operations
+7. AIResolvable → Decision: Can AI handle this?
+8. AIAutoResponse → AI provides information (order status, FAQs)
+9. InstantConfirmation → Quick resolution confirmation
+10. ImmediateIssue → Decision: Urgent or can wait?
+11. AIAssistedRouting → Urgent escalation to human agent
+12. TicketCreation → Create ticket for non-urgent issues
+
+TOOLS:
+- live_information, knowledge_base, verification, image_analysis, 
+  assign_agent, raise_ticket, order_action (all placeholders)
 """
 
 import json
@@ -89,8 +107,22 @@ class CustomerSupportAgent:
             logger.info(f"   Tool Sequence: {analysis.get('tool_sequence', 'parallel')}")
             logger.info(f"   Needs De-escalation: {analysis.get('needs_de_escalation', False)}")
             
+            # WORKFLOW ROUTING: Validate and route based on workflow stage
+            workflow_stage = analysis.get('workflow_stage', 'AIAutoResponse')
+            next_stage = analysis.get('next_stage', '')
+            workflow_path = analysis.get('workflow_path', [workflow_stage])
+            
+            logger.info(f"📍 WORKFLOW ROUTING:")
+            logger.info(f"   Current Stage: {workflow_stage}")
+            logger.info(f"   Next Stage: {next_stage}")
+            logger.info(f"   Workflow Path: {' → '.join(workflow_path)}")
+            
+            # Validate tools match workflow stage
+            tools_to_use = self._validate_workflow_tools(workflow_stage, analysis.get('tools_to_use', []), analysis)
+            
+            logger.info(f"   Validated Tools: {tools_to_use}")
+            
             # STEP 2: Skip tool execution if we need more info from customer
-            tools_to_use = analysis.get('tools_to_use', [])
             if analysis.get('needs_more_info', False):
                 logger.info("❓ Need more info from customer - skipping tools")
                 tool_results = {}
@@ -144,6 +176,12 @@ class CustomerSupportAgent:
                 "tool_results": tool_results,
                 "tools_used": tools_to_use,
                 "cache_hit": bool(cached_analysis),
+                "workflow": {
+                    "current_stage": workflow_stage,
+                    "next_stage": next_stage,
+                    "workflow_path": workflow_path,
+                    "is_complete": analysis.get('is_workflow_complete', False)
+                },
                 "processing_time": {
                     "analysis": analysis_time,
                     "tools": tool_time,
@@ -168,51 +206,51 @@ class CustomerSupportAgent:
         context = chat_history[-5:] if chat_history else []
         current_date = datetime.now().strftime("%B %d, %Y")
         
-        analysis_prompt = f"""You are analyzing a customer support query as of {current_date}.
+        analysis_prompt = f"""Analyze customer support query (date: {current_date})
 
-        Available tools:
-        - live_information: Get real-time order status, tracking, customer data
-        - knowledge_base: Search FAQs, policies, product guides, documentation
-        - order_action: Execute refund, cancel, replacement, return label, discount
-        - raise_ticket: Create support ticket for non-urgent issues needing investigation
-        - assign_agent: Escalate to human agent for urgent/complex issues
-        - verification: Check fraud risk (use BEFORE order_action for refunds/cancels)
+        QUERY: {query}
+        HISTORY: {context}
+        CONTEXT: {memories}
 
-        USER QUERY: {query}
-        CONVERSATION HISTORY: {context}
-        PREVIOUS CONTEXT: {memories}
+        WORKFLOW STAGES (follow in order):
 
-        Think about what the customer wants and how to help them:
+        1. AIIntakeLayer: Analyze sentiment (emotion, intensity, urgency)
+        
+        2. De-Escalation: If emotion=angry/frustrated AND intensity=high → needs_de_escalation=true
+        
+        3. Sensitive Task (refund/cancel/exchange)?
+           YES → Check what info needed FIRST:
+           
+           INFORMATION GATHERING:
+           - If mentions: broken, defective, damaged, cracked, not working
+             → missing_info="photo+reason", info_category="product_defect"
+           
+           - If mentions: don't like, changed mind, wrong size, don't need
+             → missing_info="reason", info_category="preference_change"
+           
+           - If mentions: wrong item, different product
+             → missing_info="photo+description", info_category="wrong_item"
+           
+           - If missing order_id → missing_info="order_id"
+           
+           THEN determine workflow:
+           - If missing info → needs_more_info=true, workflow_stage="PreEscalationGathering"
+           - If have all info → workflow_stage="ComplianceVerification"
+             Tools: ["verification", "image_analysis", "assign_agent"] (sequential)
+             Note: Only include image_analysis if photo was provided
+           
+           NO → Continue to Stage 4
+        
+        4. AI Resolvable (order status, FAQs, policies)?
+           YES → workflow_stage="AIAutoResponse"
+                 Tools: ["live_information"] or ["knowledge_base"]
+           NO → Continue to Stage 5
+        
+        5. Urgent?
+           YES → workflow_stage="AIAssistedRouting", tools=["assign_agent"]
+           NO → workflow_stage="TicketCreation", tools=["raise_ticket"]
 
-        Understand their intent first. Is it clear what they need, or are they just saying "help"?
-        
-        For sensitive actions involving money or personal data (refunds, cancellations, exchanges):
-        - Check for fraud risk first (verification tool)
-        - Then connect to a human who can safely handle it (assign_agent tool)
-        - Use sequential execution so verification happens before escalation
-        
-        For simple information requests (order tracking, policies, product questions):
-        - Retrieve the information directly (live_information or knowledge_base tool)
-        - You can resolve these without human help
-        
-        If someone is very upset or the situation is complex:
-        - Connect them to a human immediately (assign_agent tool)
-        
-        If you genuinely don't understand what they want:
-        - Ask them to clarify (needs_more_info=true, no tools yet)
-        
-        If you know what they want but are missing details (like an order number):
-        - Start the process anyway, the tools will request what they need
-
-        Consider the emotional context:
-        
-        If the customer is very frustrated or angry, acknowledge that first (needs_de_escalation=true).
-        
-        Only ask for clarification when you truly don't understand their goal, not when you just need a detail like an order number.
-        
-        When multiple tools are needed, think about dependencies: should one run before the other, or can they run together?
-
-        Analyze and provide:
+        Analyze and return JSON:
 
         1. CUSTOMER INTENT: What does the customer need?
         2. SENTIMENT: Emotion, intensity, urgency
@@ -220,36 +258,21 @@ class CustomerSupportAgent:
         4. TOOL SELECTION: Which tools (if any) based on principles above
         5. RESPONSE STRATEGY: Tone, length, priority
 
-        Return ONLY valid JSON:
         {{
         "intent": "what customer needs",
-        "sentiment": {{
-            "emotion": "frustrated|satisfied|confused|urgent|neutral",
-            "intensity": "low|medium|high",
-            "urgency": "low|medium|high"
-        }},
+        "sentiment": {{"emotion": "frustrated|satisfied|confused|urgent|neutral", "intensity": "low|medium|high", "urgency": "low|medium|high"}},
         "needs_more_info": true or false,
-        "missing_info": "order_id|photo|details|confirmation|none",
+        "missing_info": "order_id|photo|reason|photo+reason|photo+description|details|none",
+        "info_category": "product_defect|preference_change|wrong_item|missing_order|none",
         "needs_de_escalation": true or false,
-        "de_escalation_message": "brief empathy statement if needed",
+        "de_escalation_message": "brief empathy if needed",
         "tools_to_use": ["tool1", "tool2"],
         "tool_sequence": "parallel|sequential",
-        "reason_for_tools": "explain why these tools match the workflow stage",
-        "enhanced_queries": {{
-            "live_information_0": "query for live information",
-            "knowledge_base_0": "query for knowledge base",
-            "order_action_0": "action type and details",
-            "verification_0": "verification check details",
-            "raise_ticket_0": "ticket details",
-            "assign_agent_0": "reason for agent assignment"
-        }},
-        "response_strategy": {{
-            "tone": "empathetic|professional|friendly|solution-focused",
-            "length": "brief|moderate|detailed",
-            "priority": "emotion_first|solution_first|information_first"
-        }},
-        "workflow_stage": "ComplianceVerification|SecureHandlingTeam|AIAutoResponse|AIAssistedRouting|TicketCreation",
-        "key_points": ["point1", "point2"]
+        "enhanced_queries": {{"live_information_0": "query", "knowledge_base_0": "query", "image_analysis_0": "analyze defect"}},
+        "response_strategy": {{"tone": "empathetic|professional|friendly", "length": "brief|moderate", "priority": "emotion_first|solution_first"}},
+        "workflow_stage": "AIIntakeLayer|DeEscalation|PreEscalationGathering|ComplianceVerification|SecureHandlingTeam|AIAutoResponse|AIAssistedRouting|TicketCreation",
+        "next_stage": "next stage",
+        "workflow_path": ["stage1", "stage2"]
         }}"""
 
         try:
@@ -359,6 +382,70 @@ class CustomerSupportAgent:
                 logger.error(f"❌ {tool_name} failed: {e}")
                 results[tool_name] = {"error": str(e)}
     
+    def _validate_workflow_tools(self, workflow_stage: str, selected_tools: List[str], analysis: Dict) -> List[str]:
+        """Validate that selected tools align with workflow stage and adjust if needed"""
+        
+        # Define expected tools for each workflow stage
+        stage_tool_mapping = {
+            "AIIntakeLayer": [],
+            "DeEscalation": [],
+            "PreEscalationGathering": [],  # NEW - gathering info before escalation
+            "SensitiveTask": [],
+            "ComplianceVerification": ["verification", "image_analysis", "assign_agent"],  # Updated - added image_analysis
+            "SecureHandlingTeam": ["assign_agent"],
+            "AIResolvable": [],
+            "AIAutoResponse": ["live_information", "knowledge_base"],
+            "InstantConfirmation": [],
+            "ImmediateIssue": [],
+            "AIAssistedRouting": ["assign_agent"],
+            "LiveAgentAssist": ["assign_agent"],
+            "QuickResolution": ["order_action"],
+            "TicketCreation": ["raise_ticket"],
+            "Investigation": [],
+            "FollowUp": [],
+            "PostResolution": []
+        }
+        
+        expected_tools = stage_tool_mapping.get(workflow_stage, [])
+        
+        # If stage has expected tools, validate selection
+        if expected_tools:
+            # Check if selected tools align with stage
+            valid_tools = [tool for tool in selected_tools if tool in expected_tools or tool in self.available_tools]
+            
+            # If ComplianceVerification, ensure proper tool chain
+            if workflow_stage == "ComplianceVerification":
+                # Always need verification and assign_agent
+                if "verification" not in valid_tools:
+                    valid_tools.insert(0, "verification")
+                if "assign_agent" not in valid_tools:
+                    valid_tools.append("assign_agent")
+                
+                # Add image_analysis only if customer provided photo (check missing_info)
+                missing_info = analysis.get('missing_info', 'none')
+                if 'photo' not in missing_info and "image_analysis" not in valid_tools:
+                    # Photo was provided, add image_analysis
+                    valid_tools.insert(1, "image_analysis")
+                    logger.info(f"   🖼️ Added image_analysis (photo available)")
+                elif 'photo' in missing_info and "image_analysis" in valid_tools:
+                    # Photo not provided yet, remove image_analysis
+                    valid_tools.remove("image_analysis")
+                    logger.info(f"   ⚠️ Removed image_analysis (no photo yet)")
+                
+                # Ensure sequential execution
+                analysis['tool_sequence'] = 'sequential'
+                logger.info(f"   ⚙️ ComplianceVerification chain: {valid_tools}")
+            
+            # If no valid tools but stage expects tools, use first expected tool
+            if not valid_tools and expected_tools:
+                valid_tools = [expected_tools[0]]
+                logger.warning(f"   ⚠️ No valid tools for {workflow_stage}, using default: {expected_tools[0]}")
+            
+            return valid_tools
+        
+        # For decision stages or no-tool stages, return selected tools as-is
+        return selected_tools
+    
     async def _generate_response(self, query: str, analysis: Dict, tool_results: Dict, 
                                  chat_history: List[Dict], memories: str = "") -> str:
         """Generate customer support response"""
@@ -371,93 +458,50 @@ class CustomerSupportAgent:
         tool_data = self._format_tool_results(tool_results)
         context = chat_history[-5:] if chat_history else []
         
-        response_prompt = f"""You are a helpful customer support assistant.
+        response_prompt = f"""Customer support response generation.
 
-        CUSTOMER QUERY: {query}
-        UNDERSTOOD INTENT: {intent}
-
-        CUSTOMER SENTIMENT:
-        - Emotion: {sentiment.get('emotion', 'neutral')}
-        - Urgency: {sentiment.get('urgency', 'medium')}
-
-        DE-ESCALATION:
-        - Needs De-escalation: {analysis.get('needs_de_escalation', False)}
-        - De-escalation Message: {analysis.get('de_escalation_message', '')}
-
-        AVAILABLE INFORMATION:
-        {tool_data}
-
-        CONVERSATION HISTORY: {context}
-        PREVIOUS CONTEXT: {memories}
-
-        RESPONSE GUIDELINES:
-
-        1. TONE: {strategy.get('tone', 'professional')}
-        - Be empathetic and understanding
-        - Acknowledge their concern/question
-        - Use clear, friendly language
-
-        2. STRUCTURE:
-        - If needs_de_escalation is true: START with the de-escalation message to acknowledge their frustration
-        - Start with acknowledgment (1 sentence max)
-        - DO NOT start the sentence with what the customer said
-        - Provide clear solution/information (direct and focused)
-        - Offer additional help only if necessary (1 sentence max)
-
-        3. SENTIMENT HANDLING:
-        - frustrated/urgent: Skip pleasantries, go straight to the solution (AFTER de-escalation if needed)
-        - confused: Give step-by-step guidance, no extra explanations
-        - satisfied: Brief, warm acknowledgment
-        - neutral: Direct and informative
-
-        4. LENGTH: 
-        - Maximum 3-4 sentences total
-        - Get to the point immediately
-        - Cut all filler words and unnecessary explanations
-        - If multiple steps are needed, use a brief numbered list
+        QUERY: {query}
+        INTENT: {intent}
+        SENTIMENT: {sentiment.get('emotion')}, urgency={sentiment.get('urgency')}
+        WORKFLOW: {analysis.get('workflow_stage')}
         
+        TOOLS EXECUTED: {"Yes" if tool_data != "No additional data available" else "No"}
+        TOOL DATA: {tool_data}
 
-        5. CRITICAL RULES:
-        - Use the provided tool data as your source of truth
-        - Be accurate - don't make up information
-        - If you don't have information, say so in one sentence and suggest next steps
-        - Always aim to help and resolve the customer's issue
-        - Prioritize clarity over friendliness - be helpful, not chatty
+        ============ RESPONSE RULES ============
+        
+        1. CHECK TOOL EXECUTION
+        - If TOOLS EXECUTED=No → DO NOT claim "I've verified/connected/created"
+        - Only describe actions if you see ACTUAL tool results
+        
+        2. HANDLE MISSING INFO (PRIORITY #1)
+        If Needs More Info={analysis.get('needs_more_info', False)}, Missing={analysis.get('missing_info', 'none')}, Category={analysis.get('info_category', 'none')}:
+          
+          a) Show empathy (1 sentence)
+          b) Ask specifically based on missing_info:
+             - "order_id" → "Could you provide your order number?"
+             - "photo" → "Could you share a photo of [the issue]?"
+             - "reason" → "Could you tell me why you'd like [refund/exchange]?"
+             - "photo+reason" → "Could you share a photo and briefly describe what happened?"
+             - "photo+description" → "Could you share a photo and describe what you ordered vs what you got?"
+          c) Explain next step: "Once I have that, I'll [verify/connect/help]."
+          
+          STOP HERE if needs_more_info=True
+        
+        3. DE-ESCALATION
+        If needs_de_escalation={analysis.get('needs_de_escalation', False)}:
+          START with: {analysis.get('de_escalation_message', '')}
+        
+        4. USE TOOL DATA
+        - verification + image_analysis + assign_agent → "I've analyzed the issue and connected you with a specialist."
+        - verification + assign_agent → "I've verified your request and connected you with a specialist."
+        - assign_agent only → "Connecting you with an agent."
+        - live_information/knowledge_base → Answer directly from data
+        - raise_ticket → "Created ticket #[number]. Team will respond within [time]."
+        
+        5. FORMAT: Maximum 3-4 sentences, {strategy.get('tone', 'professional')} tone
 
-        6. SPECIAL HANDLING BASED ON ANALYSIS:
-        
-        CONVERSATION STATE:
-        - Needs More Info: {analysis.get('needs_more_info', False)}
-        - If true: Ask what they need help with (intent is unclear)
-        
-        TOOL RESULTS - CHECK WHAT ACTUALLY HAPPENED:
-        
-        Look at the tool results data carefully. Did tools succeed or fail?
-        
-        If a tool has an "error" field:
-        - The tool failed to execute
-        - Apologize and offer to try another way or connect to human
-        
-        If tool says it needs more information (missing field, error message about missing data):
-        - Ask for that specific information naturally
-        
-        If verification and assign_agent both succeeded:
-        - Tell customer "I've verified your request and connected you with a specialist who can help"
-        
-        If assign_agent succeeded alone:
-        - Tell customer "Connecting you with an agent now"
-        
-        If live_information or knowledge_base returned data:
-        - Use that data to answer their question directly
-        
-        If raise_ticket succeeded:
-        - Give them the ticket reference
-        
-        Base your response on ACTUAL tool results, not what was supposed to happen.
-
-        CUSTOMER QUERY: {query}
-
-        Provide a concise, direct response now (3-4 sentences maximum):"""
+        Generate response:"""
 
         try:
             max_tokens = {
@@ -586,3 +630,111 @@ class CustomerSupportAgent:
             asyncio.create_task(self.background_task_worker())
             self._worker_started = True
             logger.info("✅ Background worker started")
+    
+    @staticmethod
+    def get_workflow_stage_info() -> Dict[str, Dict[str, Any]]:
+        """Get information about all workflow stages for documentation/debugging"""
+        return {
+            "AIIntakeLayer": {
+                "description": "Initial sentiment analysis and categorization",
+                "tools": [],
+                "next_stages": ["DeEscalation", "SensitiveTask"],
+                "decision": "Check if customer needs de-escalation"
+            },
+            "DeEscalation": {
+                "description": "Handles frustrated/angry customers with empathy",
+                "tools": [],
+                "next_stages": ["SensitiveTask"],
+                "decision": "After calming, proceed to task classification"
+            },
+            "PreEscalationGathering": {
+                "description": "Gather info (photo/reason) before escalation",
+                "tools": [],
+                "next_stages": ["ComplianceVerification"],
+                "decision": "Ask for photo/reason, then proceed to verification"
+            },
+            "SensitiveTask": {
+                "description": "Decision: Refund/cancel/personal data?",
+                "tools": [],
+                "next_stages": ["PreEscalationGathering", "ComplianceVerification", "AIResolvable"],
+                "decision": "Check if info needed → PreEscalationGathering, else → ComplianceVerification"
+            },
+            "ComplianceVerification": {
+                "description": "Fraud check + image analysis for sensitive operations",
+                "tools": ["verification", "image_analysis", "assign_agent"],
+                "next_stages": ["SecureHandlingTeam"],
+                "decision": "Verify fraud risk + analyze image (if provided) + escalate to human"
+            },
+            "SecureHandlingTeam": {
+                "description": "Human handles verified sensitive operations",
+                "tools": ["assign_agent"],
+                "next_stages": ["PostResolution"],
+                "decision": "Human agent handles the case"
+            },
+            "AIResolvable": {
+                "description": "Decision: Can AI handle this?",
+                "tools": [],
+                "next_stages": ["AIAutoResponse", "ImmediateIssue"],
+                "decision": "AI can resolve → AIAutoResponse, else → ImmediateIssue"
+            },
+            "AIAutoResponse": {
+                "description": "AI provides information (order status, FAQs)",
+                "tools": ["live_information", "knowledge_base"],
+                "next_stages": ["InstantConfirmation"],
+                "decision": "Issue resolved by AI"
+            },
+            "InstantConfirmation": {
+                "description": "Quick resolution confirmation",
+                "tools": [],
+                "next_stages": ["PostResolution"],
+                "decision": "Confirm resolution and close"
+            },
+            "ImmediateIssue": {
+                "description": "Decision: Urgent or can wait?",
+                "tools": [],
+                "next_stages": ["AIAssistedRouting", "TicketCreation"],
+                "decision": "Urgent → AIAssistedRouting, else → TicketCreation"
+            },
+            "AIAssistedRouting": {
+                "description": "Urgent escalation to human agent",
+                "tools": ["assign_agent"],
+                "next_stages": ["LiveAgentAssist"],
+                "decision": "Route to available agent immediately"
+            },
+            "LiveAgentAssist": {
+                "description": "Human agent with AI assistance",
+                "tools": ["assign_agent"],
+                "next_stages": ["QuickResolution"],
+                "decision": "Agent resolves the issue"
+            },
+            "QuickResolution": {
+                "description": "Execute resolution (refund/replacement)",
+                "tools": ["order_action"],
+                "next_stages": ["PostResolution"],
+                "decision": "Action completed"
+            },
+            "TicketCreation": {
+                "description": "Create ticket for non-urgent issues",
+                "tools": ["raise_ticket"],
+                "next_stages": ["Investigation"],
+                "decision": "Ticket created for later investigation"
+            },
+            "Investigation": {
+                "description": "Background investigation (warehouse/courier)",
+                "tools": [],
+                "next_stages": ["FollowUp"],
+                "decision": "Investigation in progress"
+            },
+            "FollowUp": {
+                "description": "Proactive follow-up after resolution",
+                "tools": [],
+                "next_stages": ["PostResolution"],
+                "decision": "Follow up with customer"
+            },
+            "PostResolution": {
+                "description": "Final confirmation and feedback collection",
+                "tools": [],
+                "next_stages": [],
+                "decision": "Workflow complete"
+            }
+        }

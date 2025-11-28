@@ -91,6 +91,13 @@ async def lifespan(app: FastAPI):
         model=settings.heart_model,
         max_tokens=1000
     )
+    
+    indic_model_config = config.create_llm_config(
+        provider=settings.indic_provider,
+        model=settings.indic_model,
+        max_tokens=1000
+    )
+    
     web_model_config = config.get_tool_configs(
         web_model=settings.web_model,
         use_premium_search=settings.use_premium_search
@@ -104,12 +111,34 @@ async def lifespan(app: FastAPI):
 
     brain_llm = LLMClient(brain_model_config)
     heart_llm = LLMClient(heart_model_config)
+    indic_llm = LLMClient(indic_model_config)
     routing_llm = LLMClient(routing_config)
-    tool_manager = CSToolManager({})
-    # tool_manager = ToolManager(config, brain_llm, web_model_config, settings.use_premium_search)
+    # tool_manager = CSToolManager({})
+    tool_manager = ToolManager(config, brain_llm, web_model_config, settings.use_premium_search)
 
-    # optimizedAgent = OptimizedAgent(brain_llm, heart_llm, tool_manager, routing_llm)
-    optimizedAgent = CustomerSupportAgent(brain_llm, heart_llm, tool_manager)
+    # Initialize Zapier MCP integration
+    try:
+        zapier_initialized = await tool_manager.initialize_zapier_async()
+        if zapier_initialized:
+            logging.info("✅ Zapier MCP integration initialized successfully")
+        else:
+            logging.warning("⚠️ Zapier MCP integration not configured (ZAPIER_MCP_URL not set)")
+    except Exception as e:
+        logging.error(f"❌ Failed to initialize Zapier MCP: {e}")
+
+    # Initialize language detector if enabled
+    language_detector_llm = None
+    if config.language_detection_enabled:
+        try:
+            lang_detect_config = config.create_language_detection_config()
+            language_detector_llm = LLMClient(lang_detect_config)
+            logging.info("🌍 Language Detection Layer initialized successfully")
+        except Exception as e:
+            logging.warning(f"⚠️ Language detection initialization failed: {e}. Continuing without language detection.")
+            language_detector_llm = None
+
+    optimizedAgent = OptimizedAgent(brain_llm, heart_llm, tool_manager, routing_llm, indic_llm, language_detector_llm)
+    # optimizedAgent = CustomerSupportAgent(brain_llm, heart_llm, tool_manager)
     
     # Initialize Organization Manager
     mongo_client = MongoClient(os.getenv('MONGODB_URI', 'mongodb://localhost:27017/'))
@@ -147,6 +176,14 @@ async def lifespan(app: FastAPI):
         yield
     finally:
         logging.info("⚡ Shutting down app lifespan...")
+        
+        # Cleanup tool resources including Zapier MCP connection
+        try:
+            await tool_manager.cleanup()
+            logging.info("✅ Tool resources cleaned up (including Zapier MCP)")
+        except Exception as e:
+            logging.warning(f"⚠️ Error during tool cleanup: {e}")
+        
         optimizedAgent.worker_task.cancel()
         try:
             await optimizedAgent.worker_task

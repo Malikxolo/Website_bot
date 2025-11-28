@@ -19,7 +19,7 @@ from os import getenv
 from mem0 import AsyncMemory
 import time
 from functools import partial
-from .config import AddBackgroundTask, memory_config
+from .config import AddBackgroundTask, memory_config, SARVAM_SUPPORTED_LANGUAGES
 from .redis_manager import RedisCacheManager
 
 logger = logging.getLogger(__name__)
@@ -29,12 +29,16 @@ logger = logging.getLogger(__name__)
 class OptimizedAgent:
     """Single-pass agent that minimizes LLM calls while maintaining all functionality"""
     
-    def __init__(self, brain_llm, heart_llm, tool_manager, router_llm=None):
+    def __init__(self, brain_llm, heart_llm, tool_manager, router_llm=None, indic_llm=None, language_detector_llm=None):
         self.brain_llm = brain_llm
         self.heart_llm = heart_llm
         self.router_llm = router_llm if router_llm else heart_llm
+        self.indic_llm = indic_llm if indic_llm else heart_llm
+        self.language_detector_llm = language_detector_llm
+        self.language_detection_enabled = language_detector_llm is not None
         self.tool_manager = tool_manager
-        self.available_tools = tool_manager.get_available_tools()
+        # Include Zapier tools if available (initialized via tool_manager.initialize_zapier_async())
+        self.available_tools = tool_manager.get_available_tools(include_zapier=True)
         self.memory = AsyncMemory(memory_config)
         self.task_queue: asyncio.Queue["AddBackgroundTask"] = asyncio.Queue()
         self._worker_started = False
@@ -42,9 +46,40 @@ class OptimizedAgent:
         # Initialize Redis cache manager
         self.cache_manager = RedisCacheManager()
         
+        # Track Zapier availability for prompts
+        self._zapier_available = tool_manager.zapier_available
+        
         logger.info(f"OptimizedAgent initialized with tools: {self.available_tools}")
         logger.info(f"Router LLM: {'DEDICATED ✅' if router_llm else 'SHARED (heart_llm) ⚠️'}")
+        logger.info(f"Language Detection: {'ENABLED ✅' if self.language_detection_enabled else 'DISABLED ⚠️'}")
         logger.info(f"Redis caching: {'ENABLED ✅' if self.cache_manager.enabled else 'DISABLED ⚠️'}")
+        if self._zapier_available:
+            zapier_count = len(tool_manager.get_zapier_tools())
+            logger.info(f"Zapier MCP: ENABLED ✅ ({zapier_count} tools available)")
+    
+    def _get_tools_prompt_section(self) -> str:
+        """
+        Get the tools section for analysis prompts.
+        
+        This method dynamically generates the tools prompt by:
+        1. Including base tools (web_search, rag, calculator)
+        2. If Zapier is available, dynamically loading ALL Zapier tools
+        
+        UNIVERSAL DESIGN: When tools are added/removed in Zapier,
+        the prompt automatically updates - NO code changes required.
+        """
+        base_tools = """Available tools:
+- web_search: Current internet information
+- rag: Knowledge base retrieval  
+- calculator: Math operations"""
+        
+        if self._zapier_available:
+            # Get dynamic prompt with ALL Zapier tools (universal - auto-updates)
+            zapier_prompt = self.tool_manager.get_zapier_tools_prompt()
+            if zapier_prompt:
+                base_tools += f"\n{zapier_prompt}"
+        
+        return base_tools
     
     async def process_query(self, query: str, chat_history: List[Dict] = None, user_id: str = None, mode:str = None, source: str = "whatsapp") -> Dict[str, Any]:
         """Process query with minimal LLM calls and Redis caching"""
@@ -63,10 +98,31 @@ class OptimizedAgent:
         analysis = None
         analysis_time = 0.0
         needs_cot = None  # Track which analysis path was taken
+        detected_language = "english"  # Default language
+        english_query = query  # Default to original query
+        original_query = query  # Keep original for reference
         
         try:
-            # STEP 1: Check cache or analyze
-            cached_analysis = await self.cache_manager.get_cached_query(query, user_id)
+            # STEP 0: Language Detection Layer (if enabled)
+            if self.language_detection_enabled:
+                logger.info(f"🌍 LANGUAGE DETECTION LAYER: Processing query...")
+                lang_result = await self._detect_and_translate(query)
+                detected_language = lang_result["detected_language"]
+                english_query = lang_result["english_translation"]
+                original_query = lang_result["original_query"]
+                
+                logger.info(f"🌍 Language Detection Complete:")
+                logger.info(f"   Detected: {detected_language}")
+                logger.info(f"   Original: {original_query}")
+                logger.info(f"   English: {english_query}")
+            else:
+                logger.info(f"🌍 LANGUAGE DETECTION: Disabled, using original query")
+            
+            # Use English query for all downstream processing
+            processing_query = english_query
+            
+            # STEP 1: Check cache or analyze (using English query)
+            cached_analysis = await self.cache_manager.get_cached_query(processing_query, user_id)
             
             if cached_analysis:
                 logger.info(f"🎯 USING CACHED ANALYSIS - Skipping Brain LLM call")
@@ -76,7 +132,7 @@ class OptimizedAgent:
             else:
                 # Retrieve memories
                 eli = time.time()
-                memory_results = await self.memory.search(query[:100], user_id=user_id, limit=5)
+                memory_results = await self.memory.search(processing_query[:100], user_id=user_id, limit=5)
                 logger.info(f" Memory retrieval took {time.time() - eli:.2f}s")
                 # Detailed mem0 logging
                 logger.info(f"🧠 MEM0 SEARCH RESULTS:")
@@ -115,16 +171,16 @@ class OptimizedAgent:
                 # Route to appropriate analysis function
                 if needs_cot:
                     logger.info(f"💰 COST PATH: COMPLEX (Qwen CoT) - Deep reasoning required")
-                    analysis = await self._comprehensive_analysis(query, chat_history, memories)
+                    analysis = await self._comprehensive_analysis(processing_query, chat_history, memories)
                 else:
                     logger.info(f"💰 COST PATH: SIMPLE (Llama Fast) - Straightforward query")
-                    analysis = await self._simple_analysis(query, chat_history, memories)
+                    analysis = await self._simple_analysis(processing_query, chat_history, memories)
                 
                 analysis_time = (datetime.now() - analysis_start).total_seconds()
                 logger.info(f" Analysis completed in {analysis_time:.2f}s")
                 
                 # Cache the analysis
-                await self.cache_manager.cache_query(query, analysis, user_id, ttl=3600)
+                await self.cache_manager.cache_query(processing_query, analysis, user_id, ttl=3600)
             
             # LOG: Enhanced analysis results
             logger.info(f" ANALYSIS RESULTS:")
@@ -153,11 +209,11 @@ class OptimizedAgent:
             # STEP 2: Extract tools_to_use
             tools_to_use = analysis.get('tools_to_use', [])
             
-            # STEP 3: Execute tools
+            # STEP 3: Execute tools (using English query)
             tool_start = datetime.now()
             tool_results = await self._execute_tools(
                 tools_to_use,
-                query,
+                processing_query,  # Use English query for tools
                 analysis,
                 user_id
             )
@@ -194,7 +250,7 @@ class OptimizedAgent:
             
             # Get memories for response generation if not cached
             if not cached_analysis:
-                memory_results = await self.memory.search(query, user_id=user_id, limit=5)
+                memory_results = await self.memory.search(processing_query, user_id=user_id, limit=5)
                 
                 # Detailed mem0 logging
                 logger.info(f"🧠 MEM0 SEARCH RESULTS (Response Generation Path):")
@@ -223,20 +279,22 @@ class OptimizedAgent:
                 memories = "No previous context."
             
             final_response = await self._generate_response(
-                query,
+                processing_query,  # Use English query for context
                 analysis,
                 tool_results,
                 chat_history,
                 memories=memories,
                 mode=mode,
-                source=source
+                source=source,
+                detected_language=detected_language,  # Pass detected language
+                original_query=original_query  # Pass original query
             )
             
             await self.task_queue.put(
                 AddBackgroundTask(
                     func=partial(self.memory.add),
                     params=(
-                        [{"role": "user", "content": query}, {"role": "assistant", "content": final_response}],
+                        [{"role": "user", "content": original_query}, {"role": "assistant", "content": final_response}],
                         user_id,
                     ),
                 )
@@ -356,6 +414,73 @@ class OptimizedAgent:
         
         return guides.get(emotion, {}).get(intensity, "Be naturally helpful and friendly")
 
+    async def _detect_and_translate(self, query: str) -> Dict[str, str]:
+        """Detect language and translate to English if needed"""
+        
+        detection_prompt = f"""Analyze this query and identify its language, then translate if needed.
+
+QUERY: "{query}"
+
+YOUR TASK:
+1. Identify what language this query is written in
+2. Be specific with your language detection:
+   - If it's Roman/Latin script with Hindi vocabulary → "hinglish"
+   - If it's Devanagari script → "hindi"
+   - If it's pure English → "english"
+   - For other languages, identify accurately (malayalam, tamil, telugu, etc.)
+   - If romanized script of any Indian language → add "_romanized" (e.g., "malayalam_romanized")
+
+3. If the query is NOT in English, translate it to English while preserving the exact meaning and intent
+4. If already in English, keep it as is
+
+Think naturally using your language understanding. No pattern matching, no hardcoded rules.
+
+Return ONLY valid JSON:
+{{
+  "detected_language": "<language name or language_romanized>",
+  "english_translation": "<English version or original if already English>"
+}}
+
+Examples:
+- "kya kiya aaj?" → {{"detected_language": "hinglish", "english_translation": "what did you do today?"}}
+- "what's the weather?" → {{"detected_language": "english", "english_translation": "what's the weather?"}}
+- "क्या हाल है?" → {{"detected_language": "hindi", "english_translation": "how are you?"}}
+"""
+        
+        try:
+            logger.info(f"🌍 LANGUAGE DETECTION: Analyzing query...")
+            
+            response = await self.language_detector_llm.generate(
+                messages=[{"role": "user", "content": detection_prompt}],
+                system_prompt="You are a language detection expert. Analyze queries and return JSON only.",
+                temperature=0.1,
+                max_tokens=200
+            )
+            
+            # Extract JSON from response
+            json_str = self._extract_json(response)
+            result = json.loads(json_str)
+            
+            detected_lang = result.get('detected_language', 'english')
+            english_query = result.get('english_translation', query)
+            
+            logger.info(f"🌍 DETECTED LANGUAGE: {detected_lang}")
+            logger.info(f"📝 ENGLISH TRANSLATION: {english_query}")
+            
+            return {
+                "detected_language": detected_lang,
+                "english_translation": english_query,
+                "original_query": query
+            }
+            
+        except Exception as e:
+            logger.error(f"❌ Language detection failed: {e}, defaulting to English")
+            return {
+                "detected_language": "english",
+                "english_translation": query,
+                "original_query": query
+            }
+
     async def _route_query(self, query: str, chat_history: List[Dict] = None, memories: str = "") -> Dict[str, Any]:
         """
         Router layer: Decide if query needs Chain-of-Thought reasoning (Qwen) or simple analysis (Llama)
@@ -448,15 +573,14 @@ Return ONLY valid JSON:
 - Uses RAG + Web Search for intelligent responses
 - Serves businesses of all sizes needing to scale customer communication
 
-USER QUERY: {query}
 DATE: {current_date}
-LONG-TERM CONTEXT (Memories): {memories}
-CONVERSATION HISTORY: {context}
 
-Available tools:
-- web_search: Current internet information
-- rag: Knowledge base retrieval
-- calculator: Math operations
+USER'S LATEST QUERY (analyze THIS): "{query}"
+
+BACKGROUND CONTEXT (Long-term memories):
+{memories}
+
+{self._get_tools_prompt_section()}
 
 Perform ALL of the following analyses in ONE response:
 
@@ -481,9 +605,16 @@ Perform ALL of the following analyses in ONE response:
      * "Compare our product with competitors" → 1 task: [product comparison]
 
 2. SEMANTIC INTENT (overall user goal)
+   - Does this query make sense on its own, or does it reference the previous response?
    - Based on the decomposed tasks, what is the user's ultimate goal?
    - Synthesize the sub-tasks into a comprehensive understanding of what they want to achieve
    - Include every specific number, measurement, name, date, and technical detail from the user's query
+        
+   SPECIAL CASE - Language Change Requests:
+   If the query is requesting a language change (e.g., "in english", "in hindi", "hindi me"):
+    - Check conversation history: Does a previous assistant response exist?
+    - If YES (previous response exists): "User wants the previous assistant response translated to [language]"
+    - If NO (no previous response): "User wants future responses in [language]"
 
 3. MOCHAN-D PRODUCT OPPORTUNITY ANALYSIS:
     ⚠️ FIRST: Ask yourself - "Is the user seeking help for THEIR BUSINESS or for THEMSELVES as a consumer?"
@@ -557,9 +688,17 @@ Does the user's query relate to problems that Mochan-D's AI chatbot solution can
 
    For EACH sub-task identified in step 1, select the most appropriate tool:
    
+   CRITICAL: ONLY select tools that are listed in Available Tools above!
+   - If user asks to create Google Docs but no zapier_gdocs_* tool exists → do NOT select any Zapier tool
+   - If user asks to send Slack message but no zapier_slack_* tool exists → do NOT select any Zapier tool
+   - Never invent tool names or use wildcard patterns like "zapier_*"
+   
    GENERAL TOOL SELECTION:
    - `web_search`: For current information, prices, comparisons, weather, news, etc.
    - `calculator`: For mathematical calculations, statistical operations
+   - `zapier_*`: For external app actions (email, Slack, calendar, CRM, etc.) - only if Zapier tools available
+     IMPORTANT: Zapier tools work with NATURAL LANGUAGE instructions, NOT structured params!
+     Example: "Send email to john@example.com about meeting tomorrow" (natural language, NOT JSON)
    
     AFTER SELECTING ALL GENERAL TOOLS - APPLY RAG SELECTION (GLOBAL CHECK):
     Select `rag` if ANY of:
@@ -581,11 +720,7 @@ Does the user's query relate to problems that Mochan-D's AI chatbot solution can
    - User's emotional state (frustrated/excited/casual/urgent/confused)
    - Best response personality (empathetic_friend/excited_buddy/helpful_dost/urgent_solver/patient_guide)
 
-6. RESPONSE STRATEGY:
-   - Response length (micro/short/medium/detailed)
-   - Language style (hinglish/english/professional/casual)
-
-7. TOOL ORCHESTRATION AND EXECUATION PLANNING - CAN DIFFERENT TOOLS RUN TOGETHER?
+6. TOOL ORCHESTRATION AND EXECUATION PLANNING - CAN DIFFERENT TOOLS RUN TOGETHER?
    
    Think about dependencies BETWEEN tool types (not within same tool type):
    
@@ -610,11 +745,12 @@ Does the user's query relate to problems that Mochan-D's AI chatbot solution can
     - RAG: "Mochan-D" + [specific topic from sub-task]
     - Calculator: Extract numbers from sub-task, create valid Python expression
     - Web_search: Transform sub-task into focused search query, preserve qualifiers (when, how much, what type), add "2025" if time-sensitive
+    - Zapier_*: Write NATURAL LANGUAGE instructions describing the action (e.g., "Send email to john@example.com with subject 'Meeting' and body 'See you tomorrow'")
     
    Note: All web_search queries always run parallel among themselves.
    This is only about cross-tool dependencies (rag ↔ web_search ↔ calculator)
 
-8. Is this a follow-up query?
+7. Is this a follow-up query?
    - Look at conversation history: Does current query build on previous topics?
    - Follow-up = asking for details, clarification, or diving deeper into what was discussed
    - New query = completely different topic or no conversation history
@@ -651,7 +787,8 @@ Return ONLY valid JSON:
   "enhanced_queries": {{
     "rag_0": "query for rag",
     "web_search_0": "focused search query",
-    "calculator_0": "math expression"
+    "calculator_0": "math expression",
+    "zapier_gmail_send_email_0": "Send email to recipient@example.com with subject 'Your Subject' and body 'Your message here'"
   }},
   "tool_reasoning": "why these tools selected",
   "sentiment": {{
@@ -661,7 +798,6 @@ Return ONLY valid JSON:
   "response_strategy": {{
     "personality": "empathetic_friend|excited_buddy|helpful_dost|urgent_solver|patient_guide",
     "length": "micro|short|medium|detailed",
-    "language": "hinglish|english|professional|casual",
     "tone": "friendly|professional|empathetic|excited"
   }},
   "key_points_to_address": ["point1", "point2"]
@@ -669,8 +805,11 @@ Return ONLY valid JSON:
         try:
             logger.info(f"💨 SIMPLE ANALYSIS (Llama Fast Path)")
             
+            messages = chat_history[-4:] if chat_history else []
+            messages.append({"role": "user", "content": analysis_prompt})
+            
             response = await self.router_llm.generate(
-                messages=[{"role": "user", "content": analysis_prompt}],
+                messages,
                 system_prompt=f"You analyze queries as of {current_date}. Return valid JSON only.",
                 temperature=0.1,
                 max_tokens=4000
@@ -731,10 +870,7 @@ Return ONLY valid JSON:
         
         analysis_prompt = f"""You are analyzing a user query for Mochan-D as of {current_date} - an AI chatbot that automates customer support across WhatsApp, Facebook, Instagram with RAG and web search capabilities.
 
-Available tools:
-- web_search: Current internet data
-- rag: Knowledge base retrieval  
-- calculator: Math operations
+{self._get_tools_prompt_section()}
 
 USER QUERY: {query}
 
@@ -828,6 +964,11 @@ THINK THROUGH THESE QUESTIONS (use your intelligence, not rules):
    For rag queries:
    - Natural language is OK: "product features value proposition"
    - You're searching internal documents
+   
+   For zapier_* queries (email, Slack, calendar, etc.):
+   - Write NATURAL LANGUAGE instructions, NOT structured JSON!
+   - Example: "Send email to john@example.com with subject 'Meeting Tomorrow' and body 'Let's discuss the project'"
+   - Zapier AI extracts the params from your instructions automatically
 
 6. TOOL ORCHESTRATION - CAN DIFFERENT TOOLS RUN TOGETHER?
    
@@ -897,7 +1038,8 @@ OUTPUT THIS EXACT JSON STRUCTURE:
   "enhanced_queries": {{
     "rag_0": "query for rag",
     "web_search_0": "first focused search",
-    "web_search_1": "second focused search"
+    "web_search_1": "second focused search",
+    "zapier_gmail_send_email_0": "Send email to user@example.com with subject 'Subject Here' and body 'Message content here'"
   }},
   "tool_reasoning": "why these tools",
   "sentiment": {{
@@ -1233,8 +1375,17 @@ Think through each question naturally, then return ONLY the JSON. No other text.
             return original_query
 
     
-    async def _generate_response(self, query: str, analysis: Dict, tool_results: Dict, chat_history: List[Dict], memories:str="", mode:str="", source: str = "whatsapp") -> str:
+    async def _generate_response(self, query: str, analysis: Dict, tool_results: Dict, chat_history: List[Dict], memories:str="", mode:str="", source: str = "whatsapp", detected_language: str = "english", original_query: str = None) -> str:
         """Generate response with simple business mode switching like old system"""
+        
+        # Use original query if provided, otherwise use the query parameter
+        if original_query is None:
+            original_query = query
+        
+        logger.info(f"📝 RESPONSE GENERATION:")
+        logger.info(f"   Detected Language: {detected_language}")
+        logger.info(f"   Original Query: {original_query}")
+        logger.info(f"   English Query (for context): {query}")
         
         # Extract key elements
         intent = analysis.get('semantic_intent', '')
@@ -1258,7 +1409,7 @@ Think through each question naturally, then return ONLY the JSON. No other text.
         logger.info(f"   Sentiment Guidance: {sentiment_guidance}")
         logger.info(f"   Response Personality: {strategy.get('personality', 'helpful_dost')}")
         logger.info(f"   Response Length: {strategy.get('length', 'medium')}")
-        logger.info(f"   Language Style: {strategy.get('language', 'hinglish')}")
+        logger.info(f"   Language Style: {strategy.get('detectedlanguage', 'english')}")
         
         # Format tool results
         tool_data = self._format_tool_results(tool_results)
@@ -1363,12 +1514,23 @@ Think through each question naturally, then return ONLY the JSON. No other text.
 
             YOUR PERSONALITY:
 
-            Base Mode (Casual Dost): Warm, friendly Hinglish, picks up emotional cues, conversational not robotic
+            Base Mode (Casual Dost): Warm, friendly, picks up emotional cues, conversational not robotic
             Maintain warmth and friendliness while using respectful language:
             - Speak like a professional friend, not a street buddy
             - Use respectful pronouns and verb forms in Hindi/Urdu
             
             Business Mode (Smart Consultant): Maintains friendly tone + strategic depth, spots pain points, connects to solutions naturally (NEVER forced)
+            
+            CRITICAL - LANGUAGE OVERRIDE:
+            User's current detected language: {detected_language}
+
+            Respond ONLY in this detected language. Match the exact script the user just used.
+
+            If the user switched language from previous messages, you MUST switch with them.
+            Ignore all conversation history language patterns.
+            Ignore all memory language patterns.
+
+            This rule overrides everything else - personality, history, memories, all other instructions.
 
             CURRENT CONVERSATION CONTEXT:
             - User Intent: {intent}
@@ -1396,13 +1558,11 @@ Think through each question naturally, then return ONLY the JSON. No other text.
             
             NOTE: Provide links if web search is used (Use a view friendly format).
             
-            CONVERSATION HISTORY: {context}
-            LONG-TERM CONTEXT (Memories): {memories}
+            LONG-TERM CONTEXT (Memories use if relevant): {memories}
 
-            RESPONSE REQUIREMENTS:
-            - Personality: {strategy.get('personality', 'helpful_dost')}
-            - Length: {strategy.get('length', 'medium')} 
-            - Language: {strategy.get('language', 'hinglish')}
+            RESPONSE REQUIREMENTS
+            - Personality: {strategy.get('personality', 'helpfuldost')}
+            - Length: {strategy.get('length', 'medium')}            
             - Tone: {strategy.get('tone', 'friendly')}
 
             🎯 RESPONSE RULES:
@@ -1456,7 +1616,7 @@ Think through each question naturally, then return ONLY the JSON. No other text.
             
             ✅ DO: Sound like smart friend who knows solutions, build relationships, use data invisibly, match communication style, create value even if no sale today
 
-            USER QUERY: {query}
+            USER QUERY: {original_query}
 
             {'WHATSAPP CONTEXT: You are communicating via WhatsApp where brevity is essential for mobile engagement. ' + ('This is a FOLLOW-UP query - user wants depth on previous discussion. Provide 350-450 character response with comprehensive insights, examples, and actionable details. Use the space fully.' if analysis.get('is_follow_up', False) else 'This is an INITIAL query - create engagement spark. Compress response to 200-250 characters maximum - deliver the most critical insight that invites further conversation. Platform constraints override data volume.') if source == 'whatsapp' else ''}
 
@@ -1467,28 +1627,49 @@ Think through each question naturally, then return ONLY the JSON. No other text.
         try:
             
             max_tokens = {
-                "micro": 150,
-                "short": 300,
-                "medium": 500,
-                "detailed": 700
+                "micro": 1500,
+                "short": 3000,
+                "medium": 5000,
+                "detailed": 7000
             }.get(strategy.get('length', 'medium'), 500)
+            
+            language = detected_language.lower()
             
             logger.info(f" CALLING HEART LLM for response generation...")
             logger.info(f" Max tokens: {max_tokens}, Temperature: 0.4")
             
             messages = chat_history[-4:] if chat_history else []
             messages.append({"role": "user", "content": response_prompt})
+            if language in SARVAM_SUPPORTED_LANGUAGES:
+                response = await self.indic_llm.generate(
+                    messages,
+                    temperature=0.4,
+                    max_tokens=4000 if mode == 'transformative' else max_tokens,
+                    system_prompt = f"""User's current language: {detected_language}
+
+                    Respond ONLY in this language using the SAME alphabet/characters the user typed.
+                    If hinglish/romanized indian language → use Roman letters (a-z) like "mein", "hai", "kya"
+                    If hindi → use Devanagari (क, ख, ग)
+                    If english → use English only
+
+                    Answer based on the provided data."""
+                )
+        
+            else:
+                response = await self.heart_llm.generate(
+                    messages,
+                    temperature=0.4,
+                    max_tokens=4000 if mode == 'transformative' else max_tokens,
+                    system_prompt = f"""User's current language: {detected_language}
+
+                    Respond ONLY in this language using the SAME alphabet/characters the user typed.
+                    If hinglish → use Roman letters (a-z) like "mein", "hai", "kya"
+                    If hindi → use Devanagari (क, ख, ग)
+                    If english → use English only
+
+                    Answer based on the provided data."""
+                )
             
-            response = await self.heart_llm.generate(
-                messages,
-                temperature=0.4,
-                max_tokens=4000 if mode == 'transformative' else max_tokens,
-                system_prompt="Answer the query based on the provided context and data."
-            )
-            
-            
-            
-            # LOG: Raw response from Heart LLM
             logger.info(f" HEART LLM RAW RESPONSE: {len(response)} chars")
             logger.info(f" First 200 chars: {response[:200]}...")
             
@@ -1543,12 +1724,56 @@ Think through each question naturally, then return ONLY the JSON. No other text.
         formatted = []
         
         for tool, result in tool_results.items():
-            if isinstance(result, dict) and 'error' not in result:
+            if isinstance(result, dict):
+                # FIRST: Check for success - if success is True, skip error checking
+                if result.get('success') is True:
+                    logger.info(f"Tool {tool} executed successfully, processing result")
+                    # Fall through to result processing below
+                # Check for errors or clarification questions (only if not success)
+                elif result.get('error'):
+                    error_msg = result.get('error')
+                    
+                    # Check if this is a Zapier clarification question
+                    # Handle None safely with str() conversion
+                    error_str = str(error_msg) if error_msg else ''
+                    if result.get('needs_clarification') or 'Question:' in error_str:
+                        clarification = result.get('clarification_question', error_msg)
+                        formatted.append(f"{tool.upper()} NEEDS CLARIFICATION:\n{clarification}\n")
+                        logger.info(f"Warning: Tool {tool} needs clarification: {clarification}")
+                    else:
+                        formatted.append(f"{tool.upper()} ERROR:\n{error_msg}\n")
+                        logger.info(f"Error: Tool {tool} error: {error_msg}")
+                    continue
+                
                 # Check if LLMLayer or Perplexity (pre-formatted responses)
                 if result.get('provider') in ['llmlayer', 'perplexity'] and 'llm_response' in result:
                     provider_name = result.get('provider', '').upper()
                     logger.info(f" {provider_name} pre-formatted response detected")
                     formatted.append(f"{tool.upper()} ({provider_name}):\n{result['llm_response']}\n")
+                    continue
+                
+                # Handle Zapier MCP tool results (success with nested content structure)
+                if result.get('success') is True and result.get('tool') and 'zapier' in result.get('tool', '').lower():
+                    zapier_result = result.get('result', {})
+                    # Extract content from MCP response format
+                    if isinstance(zapier_result, dict) and 'content' in zapier_result:
+                        content_items = zapier_result.get('content', [])
+                        for item in content_items:
+                            if isinstance(item, dict) and item.get('type') == 'text':
+                                text_content = item.get('text', '')
+                                try:
+                                    # Try to parse JSON for readable formatting
+                                    import json
+                                    parsed = json.loads(text_content)
+                                    if 'results' in parsed:
+                                        formatted.append(f"{tool.upper()} COMPLETED SUCCESSFULLY:\n{json.dumps(parsed['results'], indent=2)}")
+                                    else:
+                                        formatted.append(f"{tool.upper()} COMPLETED SUCCESSFULLY:\n{json.dumps(parsed, indent=2)}")
+                                except (json.JSONDecodeError, TypeError):
+                                    formatted.append(f"{tool.upper()} COMPLETED SUCCESSFULLY:\n{text_content}")
+                    else:
+                        formatted.append(f"{tool.upper()} COMPLETED SUCCESSFULLY:\n{zapier_result}")
+                    logger.info(f"Zapier tool {tool} result formatted successfully")
                     continue
                 
                 # Handle RAG-style result

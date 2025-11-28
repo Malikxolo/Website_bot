@@ -753,6 +753,76 @@ class VerificationTool(BaseTool):
             logger.debug("VerificationTool session closed")
 
 
+class ImageAnalysisTool(BaseTool):
+    """Analyze product images for damage, defects, or verification"""
+    
+    def __init__(self, vision_api_key: str = None):
+        super().__init__(
+            "image_analysis",
+            "Analyze product photos to verify damage, defects, or issues. Use for: broken items, defective products, wrong items delivered. Returns damage assessment and recommendation."
+        )
+        self.vision_api_key = vision_api_key
+        self.session = None
+        
+        logger.info("ImageAnalysisTool initialized")
+    
+    async def execute(self, image_url: str = None, image_base64: str = None, 
+                     issue_type: str = None, query: str = None, **kwargs) -> Dict[str, Any]:
+        """
+        Analyze product image
+        
+        Args:
+            image_url: URL to image
+            image_base64: Base64 encoded image
+            issue_type: Type of issue (broken, defective, wrong_item)
+            query: Customer's description of the issue
+        """
+        self._record_usage()
+        logger.info(f"Image analysis: issue_type={issue_type}")
+        
+        try:
+            if not self.session:
+                self.session = aiohttp.ClientSession()
+            
+            # TODO: Implement vision API call (OpenAI Vision, Claude Vision, Google Vision)
+            # Example implementation:
+            # 1. Send image to vision API
+            # 2. Analyze for damage/defects
+            # 3. Extract description and severity
+            # 4. Return structured analysis
+            
+            logger.info(f"Analyzing image for: {query}")
+            
+            # Placeholder implementation
+            return {
+                "success": True,
+                "analysis": {
+                    "damage_detected": True,  # PLACEHOLDER
+                    "damage_type": "physical_damage",  # PLACEHOLDER
+                    "severity": "moderate",  # low, moderate, severe
+                    "description": "Visual inspection shows potential product defect",
+                    "confidence": 0.85,
+                    "recommendation": "escalate_to_specialist"
+                },
+                "status": "PENDING_IMPLEMENTATION",
+                "message": "Image analysis not yet implemented - placeholder response"
+            }
+            
+        except Exception as e:
+            logger.error(f"Image analysis failed: {str(e)}")
+            return {
+                "success": False,
+                "error": f"Image analysis failed: {str(e)}",
+                "analysis": None
+            }
+    
+    async def close(self):
+        """Close HTTP session"""
+        if self.session:
+            await self.session.close()
+            logger.debug("ImageAnalysisTool session closed")
+
+
 class ToolManager:
     """Manages all customer support tools"""
     
@@ -800,10 +870,16 @@ class ToolManager:
             api_key=order_action_config.get("api_key")
         )
         
-        # Verification Tool (NEW)
+        # Verification Tool
         verification_config = self.config.get("verification", {})
         self.tools["verification"] = VerificationTool(
             fraud_api_key=verification_config.get("fraud_api_key")
+        )
+        
+        # Image Analysis Tool
+        image_config = self.config.get("image_analysis", {})
+        self.tools["image_analysis"] = ImageAnalysisTool(
+            vision_api_key=image_config.get("vision_api_key")
         )
         
         logger.info(f"✅ Initialized {len(self.tools)} tools: {list(self.tools.keys())}")

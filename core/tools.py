@@ -951,6 +951,7 @@ class ToolManager:
     """
     Manages all available tools with multi-provider support
     ✅ Updated: Passes all SERP provider keys to WebSearchTool
+    ✅ NEW: Zapier MCP integration for 8000+ app actions
     """
     
     def __init__(
@@ -958,13 +959,19 @@ class ToolManager:
         config, 
         llm_client: LLMClient, 
         web_model: str = None, 
-        use_premium_search: bool = False
+        use_premium_search: bool = False,
+        enable_zapier: bool = None  # Auto-detect from env if None
     ):
         self.config = config
         self.llm_client = llm_client
         self.web_model = web_model
         self.use_premium_search = use_premium_search
         self.tools: Dict[str, BaseTool] = {}
+        
+        # Zapier integration
+        self._zapier_manager = None
+        self._zapier_enabled = enable_zapier
+        
         self._initialize_tools()
         
         logger.info(f"ToolManager initialized with web model: {web_model}")
@@ -986,6 +993,8 @@ class ToolManager:
         # RAG Tool (always available)
         self.tools["rag"] = RAGTool(self.llm_client)
         logger.info("✅ RAG tool initialized")
+        
+        # Note: Zapier tools initialized separately via initialize_zapier_async()
     
     def _initialize_web_search(self, tool_configs: Dict[str, Any]):
         """Initialize web search with multi-provider support"""
@@ -1083,13 +1092,120 @@ class ToolManager:
         except Exception as e:
             logger.error(f"❌ Failed to initialize web search: {str(e)}")
     
+    async def initialize_zapier_async(self) -> bool:
+        """
+        Initialize Zapier MCP integration (async).
+        
+        Call this after ToolManager creation to enable Zapier tools.
+        Zapier requires async initialization for network calls.
+        
+        Returns:
+            True if Zapier initialized successfully
+        """
+        # Check if Zapier should be enabled
+        if self._zapier_enabled is None:
+            # Auto-detect from environment
+            mcp_enabled = os.getenv("MCP_ENABLED", "false").lower() == "true"
+            zapier_url = os.getenv("ZAPIER_MCP_SERVER_URL")
+            self._zapier_enabled = mcp_enabled and bool(zapier_url)
+        
+        if not self._zapier_enabled:
+            logger.info("ℹ️ Zapier MCP integration disabled (set MCP_ENABLED=true and ZAPIER_MCP_SERVER_URL)")
+            return False
+        
+        try:
+            # Import here to avoid circular imports and make it optional
+            from .mcp import ZapierToolManager, MCPSecurityManager
+            
+            logger.info("🔄 Initializing Zapier MCP integration...")
+            
+            # Create security manager
+            security = MCPSecurityManager()
+            
+            if not security.is_zapier_configured():
+                logger.warning("⚠️ Zapier MCP not configured - skipping")
+                return False
+            
+            # Create and initialize Zapier tool manager
+            self._zapier_manager = ZapierToolManager(security)
+            initialized = await self._zapier_manager.initialize()
+            
+            if initialized:
+                zapier_tools = self._zapier_manager.get_tool_names()
+                logger.info(f"✅ Zapier MCP integration initialized with {len(zapier_tools)} tools")
+                
+                # Log some example tools
+                if zapier_tools:
+                    examples = zapier_tools[:5]
+                    logger.info(f"   📋 Example tools: {', '.join(examples)}")
+                
+                return True
+            else:
+                logger.warning("⚠️ Zapier MCP initialization failed")
+                return False
+                
+        except ImportError as e:
+            logger.warning(f"⚠️ Zapier MCP module not available: {e}")
+            return False
+        except Exception as e:
+            logger.error(f"❌ Zapier MCP initialization error: {e}")
+            return False
+    
+    @property
+    def zapier_available(self) -> bool:
+        """Check if Zapier tools are available"""
+        return self._zapier_manager is not None and self._zapier_manager.is_available
+    
+    def get_zapier_tools(self) -> List[str]:
+        """Get list of available Zapier tool names"""
+        if self._zapier_manager:
+            return self._zapier_manager.get_tool_names()
+        return []
+    
+    def get_zapier_tool_schemas(self) -> Dict[str, Dict[str, Any]]:
+        """Get Zapier tool schemas for LLM prompts"""
+        if self._zapier_manager:
+            return self._zapier_manager.get_tool_schemas()
+        return {}
+    
+    def get_zapier_tools_prompt(self) -> str:
+        """
+        Get dynamic prompt section for all Zapier tools.
+        
+        This returns a formatted string for LLM prompts that automatically
+        includes ALL available Zapier tools with their descriptions and
+        required parameters.
+        
+        Universal design: When tools are added/removed in Zapier, the prompt
+        automatically updates - NO code changes required.
+        
+        Returns:
+            Formatted prompt string, or empty string if Zapier not available
+        """
+        if self._zapier_manager:
+            return self._zapier_manager.get_tools_prompt()
+        return ""
+    
     def get_tool(self, name: str) -> Optional[BaseTool]:
         """Get tool by name"""
         return self.tools.get(name)
     
-    def get_available_tools(self) -> List[str]:
-        """Get list of available tool names"""
-        return list(self.tools.keys())
+    def get_available_tools(self, include_zapier: bool = False) -> List[str]:
+        """
+        Get list of available tool names.
+        
+        Args:
+            include_zapier: Include Zapier tools in the list
+            
+        Returns:
+            List of tool names
+        """
+        tools = list(self.tools.keys())
+        
+        if include_zapier and self._zapier_manager:
+            tools.extend(self._zapier_manager.get_tool_names())
+        
+        return tools
     
     def get_tool_descriptions(self) -> Dict[str, str]:
         """Get descriptions of all available tools"""
@@ -1104,13 +1220,73 @@ class ToolManager:
         **kwargs
     ) -> Dict[str, Any]:
         """
-        Execute a tool by name
+        Execute a tool by name (supports both built-in and Zapier tools)
         
         Args:
             tool_name: Name of the tool to execute
             **kwargs: Tool-specific arguments
         """
         
+        # Check if it's a Zapier tool
+        if tool_name.startswith("zapier_") and self._zapier_manager:
+            logger.info(f"🔧 Executing Zapier tool: {tool_name}")
+            
+            try:
+                # Extract params from kwargs
+                params = kwargs.get("params", {})
+                
+                if not params:
+                    # Build params from remaining kwargs
+                    params = {k: v for k, v in kwargs.items() 
+                              if k not in ["query", "user_id"]}
+                
+                # SMART PARAM HANDLING FOR ZAPIER:
+                # If LLM provided JSON in 'query' (e.g., {"to": "...", "subject": "...", "body": "..."})
+                # Convert it to 'instructions' format that Zapier expects
+                query_str = kwargs.get("query", "")
+                
+                if query_str and not params.get("instructions"):
+                    # Check if query is JSON (LLM-generated structured params)
+                    import json
+                    try:
+                        parsed_json = json.loads(query_str)
+                        if isinstance(parsed_json, dict):
+                            # LLM generated structured params - convert to instructions
+                            # Build natural language instructions from the params
+                            instructions_parts = []
+                            for key, value in parsed_json.items():
+                                instructions_parts.append(f"{key}: {value}")
+                            params["instructions"] = "\n".join(instructions_parts)
+                            logger.info(f"📝 Converted LLM JSON params to Zapier instructions")
+                    except (json.JSONDecodeError, TypeError):
+                        # Not JSON - use as-is for instructions
+                        params["instructions"] = query_str
+                        logger.info(f"📝 Using query string as Zapier instructions")
+                
+                result = await self._zapier_manager.execute(
+                    query=kwargs.get("query", ""),
+                    user_id=kwargs.get("user_id"),
+                    tool_name=tool_name,
+                    params=params
+                )
+                
+                if result.get("success"):
+                    logger.info(f"✅ Zapier tool '{tool_name}' executed successfully")
+                else:
+                    logger.warning(f"⚠️ Zapier tool '{tool_name}' failed: {result.get('error')}")
+                
+                return result
+                
+            except Exception as e:
+                logger.error(f"❌ Zapier tool '{tool_name}' error: {str(e)}")
+                return {
+                    "success": False,
+                    "error": f"Zapier tool execution failed: {str(e)}",
+                    "tool_name": tool_name,
+                    "provider": "zapier_mcp"
+                }
+        
+        # Standard tool execution
         tool = self.get_tool(tool_name)
         if not tool:
             logger.error(f"❌ Tool '{tool_name}' not available")
@@ -1128,7 +1304,6 @@ class ToolManager:
             result["tool_name"] = tool_name
             
             if result.get("success"):
-                
                 logger.info(f"✅ Tool '{tool_name}' executed successfully")
             else:
                 logger.warning(f"⚠️ Tool '{tool_name}' execution failed: {result.get('error')}")
@@ -1144,7 +1319,7 @@ class ToolManager:
             }
     
     def get_tool_stats(self) -> Dict[str, Any]:
-        """Get usage statistics for all tools"""
+        """Get usage statistics for all tools including Zapier"""
         
         stats = {}
         for name, tool in self.tools.items():
@@ -1158,13 +1333,18 @@ class ToolManager:
             
             stats[name] = tool_stats
         
+        # Add Zapier stats if available
+        if self._zapier_manager:
+            stats["zapier_mcp"] = self._zapier_manager.get_stats()
+        
         return stats
     
     async def cleanup(self):
-        """Cleanup tool resources"""
+        """Cleanup tool resources including Zapier"""
         
         logger.info("🧹 Cleaning up tools...")
         
+        # Cleanup standard tools
         for name, tool in self.tools.items():
             if hasattr(tool, 'close'):
                 try:
@@ -1172,5 +1352,13 @@ class ToolManager:
                     logger.debug(f"   ✅ Closed {name}")
                 except Exception as e:
                     logger.warning(f"   ⚠️ Error closing {name}: {str(e)}")
+        
+        # Cleanup Zapier
+        if self._zapier_manager:
+            try:
+                await self._zapier_manager.close()
+                logger.debug("   ✅ Closed Zapier MCP")
+            except Exception as e:
+                logger.warning(f"   ⚠️ Error closing Zapier MCP: {str(e)}")
         
         logger.info("✅ Tool cleanup complete")

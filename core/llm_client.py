@@ -11,6 +11,12 @@ from typing import Dict, List, Any, Optional
 
 logger = logging.getLogger(__name__)
 
+def remove_double_quotes(text: str) -> str:
+    """Utility to remove double quotes from text"""
+    if text.startswith('"') and text.endswith('"'):
+        return text[1:-1]
+    return text
+
 class LLMClient:
     """Universal async LLM client with multi-provider support"""
     
@@ -61,7 +67,9 @@ class LLMClient:
             elif self.config.provider == 'deepseek':
                 return await self._deepseek_request(messages, temp, tokens)
             elif self.config.provider in ['openai', 'openrouter', 'groq']:
-                return await self._openai_compatible_request(messages, temp, tokens, thinking)
+                return remove_double_quotes(await self._openai_compatible_request(messages, temp, tokens, thinking))
+            elif self.config.provider == 'sarvam':
+                return remove_double_quotes(await self._sarvam_compatible_request(messages, temp, tokens))
             else:
                 raise Exception(f"Unsupported provider: {self.config.provider}")
         except Exception as e:
@@ -144,6 +152,37 @@ class LLMClient:
             
             result = await response.json()
             return result["content"][0]["text"]
+    
+    async def _sarvam_compatible_request(self, messages: List[Dict[str, str]], 
+                                       temperature: float, max_tokens: int) -> str:
+        """Handle Sarvam-compatible API requests"""
+        
+        url  = "https://api.sarvam.ai/v1/chat/completions"
+        headers = {
+            "api-subscription-key": self.config.api_key, 
+            "Content-Type": "application/json"
+        }
+        
+        payload = {
+            "model": self.config.model,
+            "messages": messages,
+            "temperature": temperature,
+            "max_tokens": max_tokens
+        }
+        
+        async with aiohttp.ClientSession() as session:
+            async with session.post(url, headers=headers, json=payload) as response:
+                
+                logger.info(f"🤖 Sarvam response status: {response.status}")
+                
+                response_text = await response.text()
+                
+                if response.status != 200:
+                    logger.error(f"❌ 🤖 Sarvam API error: {response.status}: {response_text}")
+                    raise Exception(f"API error {response.status}: {response_text}")
+                
+                result = await response.json()
+                return result["choices"][0]["message"]["content"]
     
     async def _openai_compatible_request(self, messages: List[Dict[str, str]], 
                                        temperature: float, max_tokens: int, thinking:bool) -> str:
