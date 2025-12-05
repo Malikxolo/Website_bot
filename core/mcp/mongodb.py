@@ -321,8 +321,6 @@ class MongoDBMCPClient:
             execution_time = (asyncio.get_event_loop().time() - start_time) * 1000
             
             if response.is_success:
-                self._success_count += 1
-                
                 # Extract result from MCP response
                 result_data = response.result
                 
@@ -337,6 +335,32 @@ class MongoDBMCPClient:
                         )
                         result_data = text_content
                 
+                # Check if the result text indicates an actual failure
+                # MongoDB MCP returns success=True at protocol level but error in content
+                result_str = str(result_data).lower()
+                failure_indicators = [
+                    "you need to connect",
+                    "connect to a mongodb instance",
+                    "failed to",
+                    "error:",
+                    "unable to",
+                    "access denied",
+                    "authentication failed"
+                ]
+                
+                is_actual_failure = any(indicator in result_str for indicator in failure_indicators)
+                
+                if is_actual_failure:
+                    self._error_count += 1
+                    logger.error(f"❌ {tool_name} returned error in content: {result_data[:100]}...")
+                    return MongoDBToolResult(
+                        success=False,
+                        error=str(result_data),
+                        execution_time_ms=execution_time,
+                        tool_name=tool_name
+                    )
+                
+                self._success_count += 1
                 logger.info(f"✅ {tool_name} completed in {execution_time:.0f}ms")
                 
                 return MongoDBToolResult(

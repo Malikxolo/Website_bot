@@ -972,6 +972,10 @@ class ToolManager:
         self._zapier_manager = None
         self._zapier_enabled = enable_zapier
         
+        # MongoDB integration
+        self._mongodb_manager = None
+        self._query_agent = None
+        
         self._initialize_tools()
         
         logger.info(f"ToolManager initialized with web model: {web_model}")
@@ -1151,6 +1155,89 @@ class ToolManager:
             logger.error(f"❌ Zapier MCP initialization error: {e}")
             return False
     
+    async def initialize_mongodb_async(self) -> bool:
+        """
+        Initialize MongoDB MCP integration (async).
+        
+        Call this after ToolManager creation to enable MongoDB tools.
+        MongoDB requires async initialization for MCP server connection.
+        
+        Returns:
+            True if MongoDB initialized successfully
+        """
+        # Check if MongoDB connection string is configured
+        connection_string = os.getenv("MONGODB_MCP_CONNECTION_STRING")
+        
+        if not connection_string:
+            logger.info("ℹ️ MongoDB MCP integration disabled (MONGODB_MCP_CONNECTION_STRING not set)")
+            return False
+        
+        try:
+            # Import here to avoid circular imports
+            from .mcp.mongodb import MongoDBMCPClient
+            from .mcp.query_agent import QueryAgent
+            
+            logger.info("🔄 Initializing MongoDB MCP integration...")
+            
+            # Create MongoDB MCP client
+            self._mongodb_manager = MongoDBMCPClient(connection_string=connection_string)
+            
+            # Connect to MCP server
+            connected = await self._mongodb_manager.connect()
+            
+            if connected:
+                # CRITICAL: The MCP server is running but NOT connected to MongoDB yet!
+                # We need to explicitly call the 'connect' tool to establish database connection
+                logger.info("🔗 Establishing database connection...")
+                
+                try:
+                    connect_result = await self._mongodb_manager.execute_tool("connect", {
+                        "connectionString": connection_string
+                    })
+                    
+                    # Verify connection by listing databases
+                    verify_result = await self._mongodb_manager.execute_tool("list-databases", {})
+                    
+                    if hasattr(verify_result, 'result'):
+                        result_str = str(verify_result.result).lower()
+                        if "you need to connect" in result_str:
+                            logger.error("❌ MongoDB database connection failed - server says 'need to connect'")
+                            return False
+                        else:
+                            logger.info("✅ MongoDB database connection verified!")
+                    
+                except Exception as conn_err:
+                    logger.warning(f"⚠️ Database connection step: {conn_err}")
+                    # Continue anyway - some MCP versions may auto-connect
+                
+                # Create QueryAgent with shared LLM client
+                self._query_agent = QueryAgent(llm_client=self.llm_client)
+                
+                tools = await self._mongodb_manager.list_tools()
+                logger.info(f"✅ MongoDB MCP integration initialized with {len(tools)} tools")
+                
+                # Log some example tools
+                if tools:
+                    examples = [t.name for t in tools[:5]]
+                    logger.info(f"   📋 Example tools: {', '.join(examples)}")
+                
+                return True
+            else:
+                logger.warning("⚠️ MongoDB MCP connection failed")
+                return False
+                
+        except ImportError as e:
+            logger.warning(f"⚠️ MongoDB MCP module not available: {e}")
+            return False
+        except Exception as e:
+            logger.error(f"❌ MongoDB MCP initialization error: {e}")
+            return False
+    
+    @property
+    def mongodb_available(self) -> bool:
+        """Check if MongoDB tools are available"""
+        return self._mongodb_manager is not None and self._mongodb_manager.is_connected
+    
     @property
     def zapier_available(self) -> bool:
         """Check if Zapier tools are available"""
@@ -1190,12 +1277,13 @@ class ToolManager:
         """Get tool by name"""
         return self.tools.get(name)
     
-    def get_available_tools(self, include_zapier: bool = False) -> List[str]:
+    def get_available_tools(self, include_zapier: bool = False, include_mongodb: bool = False) -> List[str]:
         """
         Get list of available tool names.
         
         Args:
             include_zapier: Include Zapier tools in the list
+            include_mongodb: Include MongoDB tool in the list
             
         Returns:
             List of tool names
@@ -1204,6 +1292,9 @@ class ToolManager:
         
         if include_zapier and self._zapier_manager:
             tools.extend(self._zapier_manager.get_tool_names())
+        
+        if include_mongodb and self._mongodb_manager and self._mongodb_manager.is_connected:
+            tools.append("mongodb")
         
         return tools
     
@@ -1286,6 +1377,70 @@ class ToolManager:
                     "provider": "zapier_mcp"
                 }
         
+        # Check if it's a MongoDB tool
+        if tool_name == "mongodb" and self._mongodb_manager and self._query_agent:
+            logger.info(f"🔧 Executing MongoDB tool via QueryAgent")
+            
+            try:
+                query = kwargs.get("query", "")
+                
+                if not query:
+                    return {
+                        "success": False,
+                        "error": "No query provided for MongoDB operation",
+                        "tool_name": tool_name,
+                        "provider": "mongodb_mcp"
+                    }
+                
+                # Get tools prompt from MongoDB MCP client
+                tools_prompt = self._mongodb_manager.get_tools_prompt()
+                
+                # Execute via QueryAgent (NL → structured query → execution)
+                result = await self._query_agent.execute(
+                    tools_prompt=tools_prompt,
+                    instruction=query,
+                    mcp_client=self._mongodb_manager
+                )
+                
+                # Convert QueryResult to dict format
+                if result.needs_clarification:
+                    logger.info(f"❓ MongoDB needs clarification: {result.clarification_message}")
+                    return {
+                        "success": False,
+                        "needs_clarification": True,
+                        "clarification_message": result.clarification_message,
+                        "missing_fields": result.missing_fields or [],
+                        "tool_name": tool_name,
+                        "provider": "mongodb_mcp"
+                    }
+                elif result.success:
+                    logger.info(f"✅ MongoDB tool executed successfully")
+                    return {
+                        "success": True,
+                        "result": result.result,
+                        "executed_tool": result.tool_name,
+                        "params": result.params,
+                        "tool_name": tool_name,
+                        "provider": "mongodb_mcp"
+                    }
+                else:
+                    logger.warning(f"⚠️ MongoDB tool failed: {result.error}")
+                    return {
+                        "success": False,
+                        "error": result.error,
+                        "tool_name": tool_name,
+                        "provider": "mongodb_mcp"
+                    }
+                
+            except Exception as e:
+                logger.error(f"❌ MongoDB tool error: {str(e)}")
+                return {
+                    "success": False,
+                    "error": f"MongoDB tool execution failed: {str(e)}",
+                    "tool_name": tool_name,
+                    "provider": "mongodb_mcp"
+                }
+        
         # Standard tool execution
         tool = self.get_tool(tool_name)
         if not tool:
@@ -1340,7 +1495,7 @@ class ToolManager:
         return stats
     
     async def cleanup(self):
-        """Cleanup tool resources including Zapier"""
+        """Cleanup tool resources including Zapier and MongoDB"""
         
         logger.info("🧹 Cleaning up tools...")
         
@@ -1360,5 +1515,21 @@ class ToolManager:
                 logger.debug("   ✅ Closed Zapier MCP")
             except Exception as e:
                 logger.warning(f"   ⚠️ Error closing Zapier MCP: {str(e)}")
+        
+        # Cleanup MongoDB
+        if self._mongodb_manager:
+            try:
+                await self._mongodb_manager.disconnect()
+                logger.debug("   ✅ Closed MongoDB MCP")
+            except Exception as e:
+                logger.warning(f"   ⚠️ Error closing MongoDB MCP: {str(e)}")
+        
+        # Cleanup QueryAgent
+        if self._query_agent:
+            try:
+                await self._query_agent.close()
+                logger.debug("   ✅ Closed QueryAgent")
+            except Exception as e:
+                logger.warning(f"   ⚠️ Error closing QueryAgent: {str(e)}")
         
         logger.info("✅ Tool cleanup complete")

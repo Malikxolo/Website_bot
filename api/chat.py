@@ -126,6 +126,16 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logging.error(f"❌ Failed to initialize Zapier MCP: {e}")
 
+    # Initialize MongoDB MCP integration
+    try:
+        mongodb_initialized = await tool_manager.initialize_mongodb_async()
+        if mongodb_initialized:
+            logging.info("✅ MongoDB MCP integration initialized successfully")
+        else:
+            logging.warning("⚠️ MongoDB MCP integration not configured (MONGODB_MCP_CONNECTION_STRING not set)")
+    except Exception as e:
+        logging.error(f"❌ Failed to initialize MongoDB MCP: {e}")
+
     # Initialize language detector if enabled
     language_detector_llm = None
     if config.language_detection_enabled:
