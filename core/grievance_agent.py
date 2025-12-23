@@ -18,7 +18,7 @@ from datetime import datetime
 from dotenv import load_dotenv
 load_dotenv()
 from os import getenv
-from mem0 import AsyncMemory
+# from mem0 import AsyncMemory
 from functools import partial
 from .config import AddBackgroundTask, memory_config, SARVAM_SUPPORTED_LANGUAGES
 
@@ -52,7 +52,7 @@ class GrievanceAgent:
         self.available_tools = ["rag", "grievance"]
         
         # Memory for context
-        self.memory = AsyncMemory(memory_config)
+        # self.memory = AsyncMemory(memory_config)
         self.task_queue: asyncio.Queue["AddBackgroundTask"] = asyncio.Queue()
         self._worker_started = False
         
@@ -61,6 +61,7 @@ class GrievanceAgent:
         
         # Backend URL for posting grievances
         self.backend_url = getenv("GRIEVANCE_BACKEND_URL")
+        self.resolve_ward_url = getenv("RESOLVE_WARD")
         
         logger.info(f"✅ GrievanceAgent initialized")
         logger.info(f"   Available tools: {self.available_tools}")
@@ -94,13 +95,14 @@ class GrievanceAgent:
             processing_query = english_query
             
             # STEP 2: Get memories
-            memory_results = await self.memory.search(processing_query[:100], user_id=user_id, limit=5)
-            memories = "\n".join([
-                f"- {item['memory']}" 
-                for item in memory_results.get("results", []) 
-                if item.get("memory")
-            ]) or "No previous context."
-            logger.info(f"📝 Retrieved memories: {len(memories)} chars")
+            # memory_results = await self.memory.search(processing_query[:100], user_id=user_id, limit=5)
+            # memories = "\n".join([
+            #     f"- {item['memory']}" 
+            #     for item in memory_results.get("results", []) 
+            #     if item.get("memory")
+            # ]) or "No previous context."
+            memories = ""
+            # logger.info(f"📝 Retrieved memories: {len(memories)} chars")
             
             # STEP 3: Analysis
             analysis_start = datetime.now()
@@ -118,10 +120,17 @@ class GrievanceAgent:
             logger.info(f"🔧 Tools executed in {tool_time:.2f}s")
             
             # Post to backend if grievance successful
-            if ("grievance" in tool_results and 
-                tool_results["grievance"].get("success") and 
-                not tool_results["grievance"].get("needs_clarification")):
-                params = tool_results["grievance"].get("params")
+            # Find any grievance result (could be 'grievance' or 'grievance_0', etc.)
+            grievance_result = None
+            for key, val in tool_results.items():
+                if key == 'grievance' or (key.startswith('grievance_') and key.split('_')[-1].isdigit()):
+                    grievance_result = val
+                    break
+            
+            if (grievance_result and 
+                grievance_result.get("success") and 
+                not grievance_result.get("needs_clarification")):
+                params = grievance_result.get("params")
                 if params:
                     await self._post_grievance_to_backend(params, user_id)
             
@@ -140,15 +149,15 @@ class GrievanceAgent:
             logger.info(f"💬 Response generated in {response_time:.2f}s")
             
             # Add to memory in background
-            await self.task_queue.put(
-                AddBackgroundTask(
-                    func=partial(self.memory.add),
-                    params=(
-                        [{"role": "user", "content": original_query}, {"role": "assistant", "content": final_response}],
-                        user_id,
-                    ),
-                )
-            )
+            # await self.task_queue.put(
+            #     AddBackgroundTask(
+            #         func=partial(self.memory.add),
+            #         params=(
+            #             [{"role": "user", "content": original_query}, {"role": "assistant", "content": final_response}],
+            #             user_id,
+            #         ),
+            #     )
+            # )
             
             total_time = (datetime.now() - start_time).total_seconds()
             logger.info(f"⏱️ TOTAL: {total_time:.2f}s")
@@ -254,84 +263,218 @@ Examples:
             }
     
     async def _grievance_analysis(self, query: str, chat_history: List[Dict] = None, memories: str = "") -> Dict[str, Any]:
-        """Analyze query for DM office grievance handling"""
+        """Analyze query for DM office grievance handling with multi-dimensional reasoning"""
         
         context = chat_history[-4:] if chat_history else []
         current_date = datetime.now().strftime("%B %d, %Y")
         
-        analysis_prompt = f"""You are analyzing queries for a District Magistrate (DM) Office grievance system.
-This system helps citizens register and track complaints with government departments.
+        analysis_prompt = f"""You are analyzing queries for a grievance system.
+    This system helps citizens register and track complaints with government departments.
 
-DATE: {current_date}
+    DATE: {current_date}
 
-USER'S QUERY: "{query}"
+    USER'S QUERY: "{query}"
 
-CONVERSATION HISTORY: {context}
+    CONVERSATION HISTORY: {context}
 
-LONG-TERM CONTEXT (Memories): {memories}
+    Available tools:
+    - rag: Knowledge base retrieval (government policies, procedures, schemes, previous info)
+    - grievance: Citizen complaints registration to DM office
+    Use for: complaint registration, shikayat, grievance reporting, samasyaa darj karna
+    The tool extracts category, location, description and asks for clarification if needed
 
-Available tools:
-- rag: Knowledge base retrieval (government policies, procedures, schemes, previous info)
-- grievance: Citizen complaints registration to DM office
-  Use for: complaint registration, shikayat, grievance reporting, samasyaa darj karna
-  The tool extracts category, location, description and asks for clarification if needed
+    YOUR TASK: Deeply analyze the query and select appropriate tools.
 
-YOUR TASK: Analyze the query and select appropriate tools.
+    STEP 1: MULTI-TASK DETECTION
+    Think naturally: Does this query ask for ONE thing or MULTIPLE things?
 
-TOOL SELECTION RULES:
+    Examples:
+    - "Water supply problem in Gomti Nagar" → 1 task (just grievance)
+    - "Water supply problem in Gomti Nagar and tell me about water schemes" → 2 tasks (grievance + info)
+    - "Complaint about PDS ration, also what's the complaint status process" → 2 tasks (grievance + process info)
 
-1. SELECT `grievance` when user:
-   - Wants to register a complaint (shikayat, samasyaa, problem report)
-   - Reports an issue with government services
-   - Mentions department problems (PDS, Revenue, Police, Health, Education, Public Works, Water, Electricity)
-   - Uses words like: complaint, shikayat, grievance, problem, issue, report, darj karna, pareshani
+    If multiple tasks detected:
+    - Set multi_task_detected = true
+    - List each task clearly in sub_tasks array
 
-2. SELECT `rag` when user:
-   - Asks about government policies or procedures
-   - Wants information about schemes or services
-   - Asks about complaint status or tracking
-   - Needs reference information
+    STEP 2: UNDERSTAND OVERALL INTENT
+    What does the user ultimately want to achieve?
+    - If filing grievance + asking about process → "User wants to file complaint and understand the system"
+    - If asking about multiple departments → "User needs information about various government services"
 
-3. SELECT BOTH when:
-   - Registering a complaint that might need policy context
-   
-4. SELECT NO tools when:
-   - Greetings, casual conversation
-   - Simple thank you or acknowledgment
-   - Questions answerable from conversation context
+    Synthesize the big picture, don't just repeat the query.
 
-EXECUTION ORDER:
-- If both tools needed, list them in order of execution (e.g., ["rag", "grievance"] means rag first, then grievance)
-- Tools will be executed in the order you provide
+    STEP 3: MULTI-DIMENSIONAL TOOL SELECTION
 
-IMPORTANT FOR GRIEVANCE TOOL:
-- Provide the user's complaint in natural language as the query
-- Include all details the user mentioned (location, department, issue)
-- Do NOT add any information the user did not provide
-- Do NOT assume or guess missing details
+    Think about EACH sub-task independently:
 
-Return ONLY valid JSON:
-{{
-  "semantic_intent": "what user wants to achieve",
-  "is_grievance_related": true or false,
-  "tools_to_use": ["tool1", "tool2"],
-  "execution_mode": "parallel or sequential",
-  "enhanced_queries": {{
-    "rag": "query for knowledge base if rag selected",
-    "grievance": "the user's complaint in natural language if grievance selected"
-  }},
-  "tool_reasoning": "why these tools selected",
-  "sentiment": {{
-    "primary_emotion": "frustrated|worried|urgent|calm|confused",
-    "intensity": "low|medium|high"
-  }},
-  "response_strategy": {{
-    "tone": "empathetic|helpful|informative|reassuring",
-    "length": "short|medium|detailed"
-  }},
-  "key_points": ["point1", "point2"]
-}}"""
-        
+    For GRIEVANCE tasks:
+    - Select `grievance` when user wants to register complaint
+    - Keywords: complaint, shikayat, grievance, problem, issue, report, darj karna, pareshani
+
+    GRIEVANCE CATEGORIES (use ONE grievance per CATEGORY, not per issue):
+    - PUBLIC_WORKS: Roads, water supply, drains, sewage, street lights, bridges, footpaths
+    - POLICE: Theft, crime, FIR, law & order, police inaction, missing person
+    - ELECTRICITY: Power supply, power cut, electric connection, transformer, meter
+    - REVENUE: Land records, property, tehsil, patwari, registry, mutation
+    - HEALTH: Hospital, PHC, medicines, ambulance, sanitation, epidemic
+    - EDUCATION: School, college, teacher, scholarship, MDM
+    - PDS: Ration card, ration shop, kerosene, food supply
+    - MUNICIPAL: Garbage, cleanliness, encroachment, building permission
+    
+    MULTI-GRIEVANCE RULE:
+    - If ALL issues belong to SAME category → use ONE grievance tool (combine issues)
+    - If issues belong to DIFFERENT categories → use SEPARATE grievance tools
+    
+    Examples:
+    - "No water + broken road" → SAME category (PUBLIC_WORKS) → 1 grievance
+    - "No water + theft" → DIFFERENT categories (PUBLIC_WORKS + POLICE) → 2 grievances
+    - "Power cut + transformer issue" → SAME category (ELECTRICITY) → 1 grievance
+    - "Ration not received + police not helping" → DIFFERENT (PDS + POLICE) → 2 grievances
+
+    For INFORMATION tasks:
+    - Select `rag` for EACH distinct information need
+    - Don't assume one rag search covers everything
+    - If multiple info needs, add rag multiple times to tools_to_use list
+
+    CRITICAL THINKING QUESTION:
+    "If I only do 1 rag search for this query, will I get complete information?"
+    - If NO → create multiple rag searches, one per information dimension
+    - User asks about schemes AND process → needs 2 separate rag searches
+    - User asks about policy in education AND health → needs 2 separate rag searches
+
+    TOOL NAMING:
+    - Use simple names: rag, grievance (no numbers/indexes)
+    - If multiple rag searches needed, add "rag" multiple times in tools_to_use list
+    - Order in the list = execution order for sequential mode
+    - Example: ["rag", "rag", "grievance"] means 2 rag searches then 1 grievance
+
+    For NO tools:
+    - Greetings, casual conversation
+    - Simple thank you or acknowledgment
+    - Questions answerable from conversation context
+
+    STEP 4: EXECUTION PLANNING
+
+    Default to PARALLEL execution (tools run simultaneously)
+    - Most grievance queries have independent information needs
+    - Example: Filing complaint + asking about schemes → parallel
+
+    Use SEQUENTIAL only if:
+    - One tool NEEDS results from another tool to work
+    - Example: "Check my complaint status then tell me next steps" → sequential (rag first, then use that info)
+    
+    For SEQUENTIAL: tools_to_use order = execution order. First tool runs first, etc.
+
+    STEP 5: QUERY OPTIMIZATION
+
+    For each selected tool, write a COMPLETE, SELF-CONTAINED query:
+
+    RAG queries:
+    - Specific, targeted to that information need
+    - Include key concepts from the query
+    - CRITICAL FOR FOLLOW-UP QUESTIONS: If user's query is vague/incomplete (like "what documents?", "how to apply?", "tell me more"), 
+      use CONVERSATION HISTORY to understand WHAT TOPIC they're asking about
+    - Add the topic/subject from conversation context to make query complete
+    
+    RAG Examples:
+    Previous conversation about PMMVY scheme, then user asks "what documents needed?"
+    → RAG query: "Pradhan Mantri Matru Vandana Yojana PMMVY required documents"
+    NOT: "required documents DM office complaint" (WRONG - ignores conversation topic!)
+    
+    Previous conversation about electricity complaint, then user asks "how to track status?"
+    → RAG query: "electricity complaint status tracking process"
+
+    Grievance queries - CRITICAL RULES:
+    - Each grievance query must be COMPLETE and SELF-CONTAINED
+    - Include ALL shared context in EVERY grievance query:
+      * User's name (if mentioned anywhere in original query)
+      * Contact info - phone/email (if mentioned anywhere)
+      * Common location (applies to all grievances from same area)
+      * Any identity/address info that applies to multiple complaints
+    - Include the specific issue details for that grievance
+    - Do NOT split shared info - DUPLICATE it in each query
+    - Do NOT assume or guess missing details
+
+    CORRECT Example of multi-grievance splitting:
+    User: "My name is Rahul, phone 9876543210. I live in Gomti Nagar. No water for 2 days and police not taking action on theft"
+    → Water = PUBLIC_WORKS, Police inaction = POLICE (DIFFERENT categories)
+    tools_to_use: ["grievance", "grievance"]
+    enhanced_queries: [
+      "My name is Rahul, phone 9876543210, Gomti Nagar. No water supply for 2 days",
+      "My name is Rahul, phone 9876543210, Gomti Nagar. Police not taking action on theft"
+    ]
+
+    CORRECT Example - SAME category, ONE grievance:
+    User: "My name is Rahul, phone 9876543210, Gomti Nagar. No water for 2 days and road is also broken"
+    → Water + Road = BOTH PUBLIC_WORKS (SAME category)
+    tools_to_use: ["grievance"]
+    enhanced_queries: [
+      "My name is Rahul, phone 9876543210, Gomti Nagar. No water supply for 2 days and road is broken"
+    ]
+    ↑ Combined into ONE grievance because same department handles both.
+
+    WRONG Example (DO NOT DO THIS):
+    User: "No water and road broken in Gomti Nagar"
+    tools_to_use: ["grievance", "grievance"]  ← WRONG! Same category, should be 1 grievance
+    enhanced_queries: ["No water in Gomti Nagar", "Road broken in Gomti Nagar"]
+
+    Single grievance example:
+    User: "Mera naam Priya hai, 8765432109. Bijli nahi aa rahi 3 din se, Lalbagh mein"
+    tools_to_use: ["grievance"]
+    enhanced_queries: ["Mera naam Priya hai, 8765432109, Lalbagh. Bijli nahi aa rahi 3 din se"]
+
+    STEP 6: ANALYZE SENTIMENT & STRATEGY
+
+    User's emotional state:
+    - frustrated (high/medium/low)
+    - urgent (high/medium/low)
+    - worried (high/medium/low)
+    - calm
+    - confused
+
+    Response approach:
+    - empathetic (for frustrated users)
+    - reassuring (for worried users)
+    - helpful (for confused users)
+    - informative (for calm queries)
+
+    Return ONLY valid JSON:
+    {{
+    "multi_task_analysis": {{
+        "multi_task_detected": true or false,
+        "sub_tasks": ["task 1 description", "task 2 description"]
+    }},
+    "semantic_intent": "overall user goal synthesized from all sub-tasks",
+    "is_grievance_related": true or false,
+    "tools_to_use": ["tool1", "tool2", "tool3"],
+    "execution_mode": "parallel or sequential",
+    "tool_execution": {{
+        "mode": "parallel or sequential",
+        "dependency_reason": "reason if sequential, empty if parallel"
+    }},
+    "enhanced_queries": ["query for first tool", "query for second tool", "...one query per tool in order"],
+    "tool_reasoning": "why these tools selected and why this many",
+    "sentiment": {{
+        "primary_emotion": "frustrated|worried|urgent|calm|confused",
+        "intensity": "low|medium|high"
+    }},
+    "response_strategy": {{
+        "tone": "empathetic|helpful|informative|reassuring",
+        "length": "short|medium|detailed"
+    }},
+    "key_points": ["point1", "point2"]
+    }}
+
+    FINAL CHECK:
+    - Did I identify ALL distinct tasks in the query?
+    - Did I create separate tool calls for each information dimension?
+    - Are my queries focused and specific?
+    - Did I synthesize a clear semantic_intent?
+    - CRITICAL: Did I include name/contact/location in EACH grievance query? (Don't lose shared context!)
+
+    Now analyze the query above."""
+
         try:
             messages = chat_history[-4:] if chat_history else []
             messages.append({"role": "user", "content": analysis_prompt})
@@ -340,13 +483,15 @@ Return ONLY valid JSON:
                 messages,
                 system_prompt=f"You analyze queries for DM office grievance system. Date: {current_date}. Return valid JSON only.",
                 temperature=0.1,
-                max_tokens=2000
+                max_tokens=3000  # Increased for multi-dimensional analysis
             )
             
             json_str = self._extract_json(response)
             result = json.loads(json_str)
             
             logger.info(f"✅ Analysis complete: {result.get('semantic_intent', 'N/A')[:100]}")
+            logger.info(f"   Multi-task: {result.get('multi_task_analysis', {}).get('multi_task_detected', False)}")
+            logger.info(f"   Sub-tasks: {result.get('multi_task_analysis', {}).get('sub_tasks', [])}")
             return result
             
         except json.JSONDecodeError as e:
@@ -360,7 +505,7 @@ Return ONLY valid JSON:
             "is_grievance_related": False,
             "tools_to_use": [],
             "execution_mode": "parallel",
-            "enhanced_queries": {},
+            "enhanced_queries": [],
             "tool_reasoning": "Fallback - direct response",
             "sentiment": {"primary_emotion": "calm", "intensity": "medium"},
             "response_strategy": {"tone": "helpful", "length": "medium"},
@@ -368,28 +513,39 @@ Return ONLY valid JSON:
         }
     
     async def _execute_tools(self, tools: List[str], query: str, analysis: Dict, user_id: str = None) -> Dict[str, Any]:
-        """Execute tools - simplified for RAG and Grievance only"""
+        """Execute tools - simplified for RAG and Grievance only
+        
+        tools_to_use and enhanced_queries are both lists in same order.
+        Example: tools=["rag", "rag", "grievance"], queries=["query1", "query2", "query3"]
+        """
         
         if not tools:
             return {}
         
         results = {}
-        enhanced_queries = analysis.get('enhanced_queries', {})
+        enhanced_queries = analysis.get('enhanced_queries', [])
         execution_mode = analysis.get('execution_mode', 'parallel')
         
-        # Filter to only available tools
-        valid_tools = [t for t in tools if t in self.available_tools]
+        # Handle both list and dict format for backward compatibility
+        if isinstance(enhanced_queries, dict):
+            enhanced_queries = list(enhanced_queries.values())
         
-        if not valid_tools:
+        # Filter tools and keep corresponding queries aligned
+        valid_tools_with_queries = []
+        for i, tool in enumerate(tools):
+            if tool in self.available_tools:
+                tool_query = enhanced_queries[i] if i < len(enhanced_queries) else query
+                valid_tools_with_queries.append((tool, tool_query))
+        
+        if not valid_tools_with_queries:
             return {}
         
-        logger.info(f"🔧 Executing tools: {valid_tools} (mode: {execution_mode})")
+        logger.info(f"🔧 Executing {len(valid_tools_with_queries)} tools (mode: {execution_mode})")
         
         if execution_mode == 'sequential':
-            # Execute in order provided by LLM
-            for tool in valid_tools:
-                tool_query = enhanced_queries.get(tool, query)
-                logger.info(f"   → {tool}: '{tool_query[:80]}...'")
+            # Execute in order - list order is execution order
+            for i, (tool, tool_query) in enumerate(valid_tools_with_queries):
+                logger.info(f"   → [{i}] {tool}: '{tool_query[:80]}...'")
                 
                 try:
                     result = await self.tool_manager.execute_tool(
@@ -397,48 +553,80 @@ Return ONLY valid JSON:
                         query=tool_query, 
                         user_id=user_id
                     )
-                    results[tool] = result
+                    # Use index to allow multiple same-tool results
+                    result_key = f"{tool}_{i}" if valid_tools_with_queries.count((tool, tool_query)) > 1 or sum(1 for t, _ in valid_tools_with_queries if t == tool) > 1 else tool
+                    results[result_key] = result
                     logger.info(f"   ✅ {tool} completed")
                 except Exception as e:
                     logger.error(f"   ❌ {tool} failed: {e}")
-                    results[tool] = {"error": str(e)}
+                    results[f"{tool}_{i}"] = {"error": str(e)}
         else:
-            # Execute in parallel
+            # Execute in parallel - order doesn't matter
             tasks = []
-            for tool in valid_tools:
-                tool_query = enhanced_queries.get(tool, query)
-                logger.info(f"   → {tool}: '{tool_query[:80]}...'")
+            for i, (tool, tool_query) in enumerate(valid_tools_with_queries):
+                logger.info(f"   → [{i}] {tool}: '{tool_query[:80]}...'")
                 
                 task = self.tool_manager.execute_tool(
                     tool,
                     query=tool_query,
                     user_id=user_id
                 )
-                tasks.append((tool, task))
+                tasks.append((i, tool, task))
             
-            for tool_name, task in tasks:
+            for i, tool_name, task in tasks:
                 try:
                     result = await task
-                    results[tool_name] = result
+                    # Use index to allow multiple same-tool results
+                    result_key = f"{tool_name}_{i}" if sum(1 for _, t, _ in tasks if t == tool_name) > 1 else tool_name
+                    results[result_key] = result
                     logger.info(f"   ✅ {tool_name} completed")
                 except Exception as e:
                     logger.error(f"   ❌ {tool_name} failed: {e}")
                     results[tool_name] = {"error": str(e)}
         
         return results
-    
+
+    async def _resolve_ward_from_location(self, address: str, city: str) -> Optional[str]:
+        """Resolve ward number from location using RAG tool"""
+        try:
+            async with aiohttp.ClientSession() as session:
+                payload = {"address": address, "city": city}
+                async with session.post(self.resolve_ward_url, json=payload) as response:
+                    if response.status == 200:
+                        data = await response.json()
+                        ward = data.get("ward_name")
+                        logger.info(f"✅ Resolved ward: {ward} for location: {address}")
+                        return ward
+                    else:
+                        logger.error(f"❌ Ward resolution failed: {response.status}")
+            return None
+        except Exception as e:
+            logger.error(f"❌ Ward resolution failed: {e}")
+            return None
+       
     async def _post_grievance_to_backend(self, params: dict, user_id: str):
         """Post successful grievance data to backend"""
         if not self.backend_url:
             logger.warning("⚠️ GRIEVANCE_BACKEND_URL not set, skipping backend posting")
             return
-            
+        
+                
+        logger.info(f"params before posting: {params}")
+        location = params.get("location", "")
+        city = location.get("city", "")
+        district, ward = location.get("district", ""), location.get("ward", "")
+        if district and ward:
+            address = f"{ward}, {district}"
+            ward = await self._resolve_ward_from_location(address, city)
+            params['location']['ward'] = ward
+  
         try:
             payload = {
                 "user_id": user_id,
                 **params
             }
             logger.info(f"📤 Posting grievance to backend: {self.backend_url}")
+            
             logger.info(f"   Payload: {payload}")
             async with aiohttp.ClientSession() as session:
                 async with session.post(self.backend_url, json=payload) as response:
@@ -497,8 +685,6 @@ TOOL DATA:
 CONVERSATION CONTEXT:
 - User Emotion: {sentiment.get('primary_emotion', 'calm')} ({sentiment.get('intensity', 'medium')})
 - Grievance Related: {is_grievance}
-
-MEMORIES (if relevant): {memories}
 
 RESPONSE GUIDELINES:
 
@@ -566,7 +752,7 @@ Now respond in {detected_language}:"""
                 )
             
             response = self._clean_response(response)
-            logger.info(f"💬 Response: {len(response)} chars")
+            logger.info(f"💬 Generated Response: {response}")
             
             return response
             
@@ -582,13 +768,16 @@ Now respond in {detected_language}:"""
         formatted = []
         
         for tool_name, result in tool_results.items():
-            if tool_name == 'rag':
+            # Handle both 'rag' and 'rag_0', 'rag_1' etc.
+            base_tool = tool_name.split('_')[0] if '_' in tool_name and tool_name.split('_')[-1].isdigit() else tool_name
+            
+            if base_tool == 'rag':
                 if isinstance(result, dict) and result.get('success'):
                     formatted.append(f"RAG RESULTS:\n{result.get('retrieved', 'No data')}")
                 elif isinstance(result, dict) and result.get('error'):
                     formatted.append(f"RAG: Error - {result.get('error')}")
             
-            elif tool_name == 'grievance':
+            elif base_tool == 'grievance':
                 if isinstance(result, dict):
                     if result.get('success'):
                         params = result.get('params', {})

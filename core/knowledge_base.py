@@ -414,7 +414,7 @@ class KnowledgeBaseManager:
         try:
             logger.info(f"Query request - org_id: {org_id}, collection_name: {collection_name}, user_id: {user_id}, query: {query_text[:50]}...")
             
-            if org != "org_default":
+            if org_id != "org_default":
                 org = await self.org_manager.get_organization(org_id)
                 if not org:
                     logger.error(f"Organization not found: {org_id}")
