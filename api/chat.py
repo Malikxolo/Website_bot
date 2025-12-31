@@ -52,8 +52,7 @@ from core import (
     LLMClient,
     ToolManager, Config
 )
-from core.cs_tools import ToolManager as CSToolManager
-from core.customer_support_agent import CustomerSupportAgent
+from core.optimized_agent import OptimizedAgent
 from core.logging_security import (
     safe_log_response,
     safe_log_user_data,
@@ -238,19 +237,21 @@ async def lifespan(app: FastAPI):
             logging.warning(f"⚠️ Language detection initialization failed: {e}. Continuing without language detection.")
             language_detector_llm = None
 
-    # Create CustomerSupportAgent (only agent for this version)
+    # Create OptimizedAgent (only agent for this version)
     global agent
-    logging.info("📞 Creating CustomerSupportAgent")
+    logging.info("🧠 Creating OptimizedAgent")
     
-    # CustomerSupportAgent uses CSToolManager (simple initialization, no params needed)
-    cs_tool_manager = CSToolManager()
-    
-    agent = CustomerSupportAgent(
+    agent = OptimizedAgent(
         brain_llm=brain_llm,
         heart_llm=heart_llm,
-        tool_manager=cs_tool_manager
+        tool_manager=tool_manager,
+        routing_llm=routing_llm,
+        simple_whatsapp_llm=simple_whatsapp_llm,
+        cot_whatsapp_llm=cot_whatsapp_llm,
+        indic_llm=indic_llm,
+        language_detector_llm=language_detector_llm
     )
-    logging.info("✅ CustomerSupportAgent initialized")
+    logging.info("✅ OptimizedAgent initialized")
     
     # Initialize Organization Manager
     mongo_client = MongoClient(os.getenv('MONGODB_URI', 'mongodb://localhost:27017/'))
@@ -283,7 +284,7 @@ async def lifespan(app: FastAPI):
     agent.worker_task = asyncio.create_task(
         agent.background_task_worker()
     )
-    logging.info("CustomerSupportAgent background worker started")
+    logging.info("OptimizedAgent background worker started")
 
     try:
         yield
@@ -369,7 +370,7 @@ async def set_brain_heart_agents(request: UpdateAgentsRequest):
 
 @router.post("/chat", dependencies=[Depends(RateLimiter(times=6, seconds=60))])
 async def chat_brain_heart_system(request: ChatMessage = Body(...)):
-    """Chat endpoint - uses CustomerSupportAgent"""
+    """Chat endpoint - uses OptimizedAgent"""
     
     try:
         user_id = request.userid
