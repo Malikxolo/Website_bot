@@ -52,7 +52,7 @@ from core import (
     LLMClient,
     ToolManager, Config
 )
-from core.sales_agent import SalesAgent
+from core.grievance_agent import GrievanceAgent as DMGrievanceAgent
 from core.logging_security import (
     safe_log_response,
     safe_log_user_data,
@@ -237,17 +237,23 @@ async def lifespan(app: FastAPI):
             logging.warning(f"⚠️ Language detection initialization failed: {e}. Continuing without language detection.")
             language_detector_llm = None
 
-    # Create SalesAgent (only agent for this version)
+    # Create GrievanceAgent (only agent for this version)
     global agent
-    logging.info("💰 Creating SalesAgent")
+    logging.info("🏛️ Creating GrievanceAgent (DM Office mode)")
     
-    agent = SalesAgent(
-        analysis_llm=sales_analysis_llm,
-        response_llm=sales_response_llm,
+    grievance_agent_config = config.create_llm_config(
+        provider=settings.grievance_agent_provider,
+        model=settings.grievance_agent_model,
+        max_tokens=4000
+    )
+    grievance_agent_llm = LLMClient(grievance_agent_config)
+    
+    agent = DMGrievanceAgent(
+        llm=grievance_agent_llm,
         tool_manager=tool_manager,
         language_detector_llm=language_detector_llm
     )
-    logging.info(f"✅ SalesAgent initialized with analysis model: {settings.sales_analysis_model} and response model: {settings.sales_response_model}")
+    logging.info(f"✅ GrievanceAgent initialized with model: {settings.grievance_agent_model}")
     
     # Initialize Organization Manager
     mongo_client = MongoClient(os.getenv('MONGODB_URI', 'mongodb://localhost:27017/'))
@@ -280,7 +286,7 @@ async def lifespan(app: FastAPI):
     agent.worker_task = asyncio.create_task(
         agent.background_task_worker()
     )
-    logging.info("SalesAgent background worker started")
+    logging.info("GrievanceAgent background worker started")
 
     try:
         yield
@@ -366,7 +372,7 @@ async def set_brain_heart_agents(request: UpdateAgentsRequest):
 
 @router.post("/chat", dependencies=[Depends(RateLimiter(times=6, seconds=60))])
 async def chat_brain_heart_system(request: ChatMessage = Body(...)):
-    """Chat endpoint - uses SalesAgent"""
+    """Chat endpoint - uses GrievanceAgent"""
     
     try:
         user_id = request.userid
