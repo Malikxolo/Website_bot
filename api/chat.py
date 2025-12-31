@@ -382,7 +382,7 @@ async def chat_brain_heart_system(request: ChatMessage = Body(...)):
         safe_log_user_data(user_id, 'brain_heart_chat', message_count=len(user_query))
         
         
-        result = await agent.process_query(user_query, chat_history, user_id)
+        result = await agent.process_query(user_query, chat_history, user_id, mode, source)
         
         if result["success"]:
             safe_log_response(result, level='info')
