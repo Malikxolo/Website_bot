@@ -39,7 +39,7 @@ class OptimizedAgent:
         self.language_detector_llm = language_detector_llm
         self.language_detection_enabled = language_detector_llm is not None
         self.tool_manager = tool_manager
-        # Include Zapier, MongoDB, Redis and Grievance tools if available
+        # Include Zapier, MongoDB, Redis tools if available
         self.available_tools = tool_manager.get_available_tools(include_zapier=True, include_mongodb=True, include_redis=True)
         self.memory = AsyncMemory(memory_config)
         self.task_queue: asyncio.Queue["AddBackgroundTask"] = asyncio.Queue()
@@ -53,7 +53,6 @@ class OptimizedAgent:
         self._zapier_available = tool_manager.zapier_available
         self._mongodb_available = tool_manager.mongodb_available
         self._redis_available = tool_manager.redis_available
-        self._grievance_available = tool_manager.grievance_available
         
         logger.info(f"OptimizedAgent initialized with tools: {self.available_tools}")
         logger.info(f"WhatsApp Routing LLM: {'DEDICATED ✅' if routing_llm else 'SHARED (heart_llm) ⚠️'}")
@@ -71,8 +70,6 @@ class OptimizedAgent:
             logger.info(f"MongoDB MCP: ENABLED ✅")
         if self._redis_available:
             logger.info(f"Redis MCP: ENABLED ✅")
-        if self._grievance_available:
-            logger.info(f"Grievance Tool: ENABLED ✅")
     
     def _get_tools_prompt_section(self) -> str:
         """
@@ -91,7 +88,6 @@ class OptimizedAgent:
         logger.info(f"  Web search available: {self._web_search_available}")
         logger.info(f"  MongoDB available: {self._mongodb_available}")
         logger.info(f"  Redis available: {self._redis_available}")
-        logger.info(f"  Grievance available: {self._grievance_available}")
         logger.info(f"  Zapier available: {self._zapier_available}")
         
         base_tools = """Available tools:
@@ -124,13 +120,6 @@ class OptimizedAgent:
     * value (for set operations)
     Example: "Set key 'user:123' to value 'John Doe' in Redis"
     NEVER assume keys from context - ALWAYS specify explicitly in each query."""
-        
-        if self._grievance_available:
-            logger.info("  Adding grievance to prompt")
-            base_tools += """
-    - grievance: Citizen complaints to government (DM office)
-    Use for: complaint registration, shikayat, grievance reporting
-    The tool extracts category, location, description automatically and asks for clarification if needed"""
         
         if self._zapier_available:
             logger.info("  Adding Zapier tools to prompt")
@@ -825,7 +814,7 @@ Does the user's query relate to problems that Mochan-D's AI chatbot solution can
     - RAG: "Mochan-D" + [specific topic from sub-task]
     - Calculator: Extract numbers from sub-task, create valid Python expression
     - Web_search: Transform sub-task into focused search query, preserve qualifiers (when, how much, what type), add "2025" if time-sensitive
-    - zapier_*, mongodb, redis, grievance: Use natural language with context from conversation history
+    - zapier_*, mongodb, redis: Use natural language with context from conversation history
     
     Note: All web_search queries always run parallel among themselves.
    This is only about cross-tool dependencies (rag ↔ web_search ↔ calculator)
@@ -868,7 +857,6 @@ Return ONLY valid JSON:
     "rag_0": "query for rag",
     "web_search_0": "focused search query",
     "calculator_0": "math expression",
-    "grievance_0": "Complaint: [specific issue] in [location]. Wants: [resolution]",
     "zapier_gmail_send_email_0": "Send email to recipient@example.com with subject 'Your Subject' and body 'Your message here'"
   }},
   "tool_reasoning": "why these tools selected",
@@ -1055,7 +1043,7 @@ THINK THROUGH THESE QUESTIONS (use your intelligence, not rules):
    - Natural language is OK: "product features value proposition"
    - You're searching internal documents
    
-   For zapier_*, mongodb, redis, grievance queries:
+   For zapier_*, mongodb, redis queries:
    - Write NATURAL LANGUAGE instructions
    - Use conversation history to create complete context
 
@@ -1098,7 +1086,7 @@ THINK THROUGH THESE QUESTIONS (use your intelligence, not rules):
 FINAL CHECK BEFORE YOU OUTPUT:
 - Did I find ALL dimensions of this query?
 - Am I being generous with search count or conservative? (Be generous!)
-- Did I use proper key names? (rag_0, web_search_0, web_search_1, grievance_0, mongodb_0, redis_0, etc.)
+- Did I use proper key names? (rag_0, web_search_0, web_search_1, mongodb_0, redis_0, etc.)
 - For complex queries: Did I generate at least 5-7 searches?
 - Did I keep the EXACT JSON structure below?
 - Did I add "rag" to tools_to_use if ANY web_search selected?
@@ -1137,7 +1125,6 @@ OUTPUT THIS EXACT JSON STRUCTURE:
     "rag_0": "query for rag",
     "web_search_0": "first focused search",
     "web_search_1": "second focused search",
-    "grievance_0": "[Specific issue] in [location]. Wants: [resolution]",
     "zapier_gmail_send_email_0": "Send email to user@example.com with subject 'Subject Here' and body 'Message content here'"
   }},
   "tool_reasoning": "why these tools",
@@ -1742,13 +1729,6 @@ Return ONLY the natural language instruction. Be specific about which resource t
             - ROI Translator: Features → their specific benefits
             - Assumptive Consultant: "How many touchpoints juggling?"
 
-            CLOSING:
-            - Grievance tool used → Confirm registration, provide grievance ID, NO follow-up questions
-            - Casual query → End naturally, no pitch
-            - Warm lead → Ask ONE question, plant seed
-            - Hot lead → Clear CTA but conversational
-            - MIX IT UP: Don't always ask questions (except grievance - never ask after grievance)
-
             CRITICAL DON'TS:
             ❌ Repeat user's words
             ❌ Corporate jargon
@@ -1964,45 +1944,6 @@ Return ONLY the natural language instruction. Be specific about which resource t
                         error_msg = result.get('error', 'Unknown error')
                         formatted.append(f"{tool.upper()} ERROR:\n{error_msg}\n")
                         logger.warning(f"Redis tool error: {error_msg}")
-                    continue
-                
-                # Handle Grievance Agent tool results
-                if result.get('provider') == 'grievance_agent':
-                    if result.get('needs_clarification'):
-                        # Grievance needs more info from user
-                        clarification_msg = result.get('clarification_message', 'Please provide more details about the grievance.')
-                        missing = result.get('missing_fields', [])
-                        if missing:
-                            formatted.append(f"{tool.upper()} NEEDS CLARIFICATION:\n{clarification_msg}\nMissing fields: {', '.join(missing)}\n")
-                        else:
-                            formatted.append(f"{tool.upper()} NEEDS CLARIFICATION:\n{clarification_msg}\n")
-                        logger.info(f"Grievance tool needs clarification: {clarification_msg} | Missing: {missing}")
-                    elif result.get('success'):
-                        # Successful grievance extraction
-                        params = result.get('params', {})
-                        if params:
-                            # Format extracted parameters in readable way
-                            param_lines = []
-                            # Required fields first
-                            for field in ['category', 'location', 'description']:
-                                if field in params and params[field]:
-                                    param_lines.append(f"  {field.replace('_', ' ').title()}: {params[field]}")
-                            # Optional fields next
-                            for field in ['sub_category', 'priority', 'complainant_type', 'expected_resolution']:
-                                if field in params and params[field]:
-                                    param_lines.append(f"  {field.replace('_', ' ').title()}: {params[field]}")
-                            formatted_params = "\n".join(param_lines)
-                            formatted.append(f"{tool.upper()} EXTRACTED SUCCESSFULLY:\n{formatted_params}\n")
-                            logger.info(f"✅ Grievance extracted: {params.get('category', 'N/A')} | {params.get('location', 'N/A')}")
-                        else:
-                            # Edge case: success but no params
-                            formatted.append(f"{tool.upper()} COMPLETED:\nGrievance processed but no parameters extracted.\n")
-                            logger.warning(f"⚠️ Grievance success but params empty")
-                    else:
-                        # Grievance error (parsing failed, exception, etc.)
-                        error_msg = result.get('error', 'Unknown error during grievance extraction')
-                        formatted.append(f"{tool.upper()} ERROR:\n{error_msg}\n")
-                        logger.error(f"❌ Grievance tool error: {error_msg}")
                     continue
                 
                 # Handle RAG-style result

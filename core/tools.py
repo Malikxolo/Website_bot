@@ -953,7 +953,6 @@ class ToolManager:
     Manages all available tools with multi-provider support
       Updated: Passes all SERP provider keys to WebSearchTool
       NEW: Zapier MCP integration for 8000+ app actions
-      NEW: Grievance tool for DM grievance tracking
     """
     
     def __init__(
@@ -980,11 +979,6 @@ class ToolManager:
         
         # Redis integration
         self._redis_manager = None
-        
-        # Grievance integration
-        self._grievance_agent = None
-        self._grievance_enabled = None  # Auto-detect from env
-        self._grievance_status_url = os.getenv("GRIEVANCE_STATUS_URL")  # URL for fetching grievance status
         
         self._initialize_tools()
         
@@ -1324,58 +1318,6 @@ class ToolManager:
             logger.error(f"❌ Redis MCP initialization error: {e}")
             return False
     
-    async def initialize_grievance_async(self) -> bool:
-        """
-        Initialize Grievance tool (async).
-        
-        Call this after ToolManager creation to enable grievance parameter extraction.
-        
-        Returns:
-            True if Grievance initialized successfully
-        """
-        # Check if Grievance is explicitly disabled via .env
-        grievance_enabled = os.getenv("GRIEVANCE_ENABLED", "true").lower() == "true"
-        if not grievance_enabled:
-            logger.info("ℹ️ Grievance tool disabled (GRIEVANCE_ENABLED=false)")
-            self._grievance_enabled = False
-            return False
-        
-        try:
-            # Import here to avoid circular imports
-            from .grievance_query_agent import GrievanceAgent
-            
-            logger.info("🔄 Initializing Grievance tool...")
-            
-            # Get grievance LLM config from .env
-            grievance_provider = os.getenv("GRIEVANCE_LLM_PROVIDER", "openrouter")
-            grievance_model = os.getenv("GRIEVANCE_LLM_MODEL", "meta-llama/llama-4-maverick")
-            
-            # Create custom LLM config for grievance
-            from core.config import Config
-            config = Config()
-            grievance_llm_config = config.create_llm_config(
-                provider=grievance_provider,
-                model=grievance_model,
-                max_tokens=2048
-            )
-            grievance_llm = LLMClient(grievance_llm_config)
-            
-            # Create GrievanceAgent with dedicated LLM client
-            self._grievance_agent = GrievanceAgent(llm_client=grievance_llm)
-            self._grievance_enabled = True
-            
-            logger.info("✅ Grievance tool initialized")
-            return True
-                
-        except ImportError as e:
-            logger.warning(f"⚠️ Grievance module not available: {e}")
-            self._grievance_enabled = False
-            return False
-        except Exception as e:
-            logger.error(f"❌ Grievance initialization error: {e}")
-            self._grievance_enabled = False
-            return False
-    
     @property
     def mongodb_available(self) -> bool:
         """Check if MongoDB tools are available"""
@@ -1390,16 +1332,6 @@ class ToolManager:
     def zapier_available(self) -> bool:
         """Check if Zapier tools are available"""
         return self._zapier_manager is not None and self._zapier_manager.is_available
-    
-    @property
-    def grievance_available(self) -> bool:
-        """Check if Grievance tool is available"""
-        return self._grievance_agent is not None and self._grievance_enabled
-    
-    @property
-    def grievance_status_available(self) -> bool:
-        """Check if Grievance Status tool is available"""
-        return self._grievance_status_url is not None
     
     def get_zapier_tools(self) -> List[str]:
         """Get list of available Zapier tool names"""
@@ -1458,12 +1390,6 @@ class ToolManager:
         if include_redis and self._redis_manager and self._redis_manager.is_connected:
             tools.append("redis")
         
-        if self._grievance_agent and self._grievance_enabled:
-            tools.append("grievance")
-        
-        if self._grievance_status_url:
-            tools.append("grievance_status")
-        
         return tools
     
     def get_tool_descriptions(self) -> Dict[str, str]:
@@ -1472,14 +1398,6 @@ class ToolManager:
             name: tool.description 
             for name, tool in self.tools.items()
         }
-        
-        # Add grievance description if available
-        if self._grievance_agent and self._grievance_enabled:
-            descriptions["grievance"] = "Extract structured grievance parameters from natural language complaints (for DM grievance tracking)"
-        
-        # Add grievance_status description if available
-        if self._grievance_status_url:
-            descriptions["grievance_status"] = "Fetch status of a grievance by its ID (track complaint progress)"
         
         return descriptions
     
@@ -1683,120 +1601,6 @@ class ToolManager:
                     "provider": "redis_mcp"
                 }
         
-        # Check if it's a Grievance tool
-        if tool_name == "grievance" and self._grievance_agent:
-            logger.info(f"🔧 Executing Grievance tool via GrievanceAgent")
-            
-            try:
-                query = kwargs.get("query", "")
-                
-                if not query:
-                    return {
-                        "success": False,
-                        "error": "No query provided for grievance extraction",
-                        "tool_name": tool_name,
-                        "provider": "grievance_agent"
-                    }
-                
-                # Execute via GrievanceAgent (NL → structured params)
-                result = await self._grievance_agent.execute(instruction=query)
-                
-                # Convert GrievanceResult to dict format
-                if result.needs_clarification:
-                    logger.info(f"❓ Grievance needs clarification: {result.clarification_message}")
-                    return {
-                        "success": False,
-                        "needs_clarification": True,
-                        "clarification_message": result.clarification_message,
-                        "missing_fields": result.missing_fields or [],
-                        "tool_name": tool_name,
-                        "provider": "grievance_agent"
-                    }
-                elif result.success:
-                    logger.info(f"✅ Grievance extracted successfully")
-                    return {
-                        "success": True,
-                        "result": result.params.to_dict() if result.params else {},
-                        "params": result.params.to_dict() if result.params else {},
-                        "tool_name": tool_name,
-                        "provider": "grievance_agent"
-                    }
-                else:
-                    logger.warning(f"⚠️ Grievance extraction failed: {result.error}")
-                    return {
-                        "success": False,
-                        "error": result.error,
-                        "tool_name": tool_name,
-                        "provider": "grievance_agent"
-                    }
-                
-            except Exception as e:
-                logger.error(f"❌ Grievance tool error: {str(e)}")
-                return {
-                    "success": False,
-                    "error": f"Grievance tool execution failed: {str(e)}",
-                    "tool_name": tool_name,
-                    "provider": "grievance_agent"
-                }
-        
-        # Check if it's a Grievance Status tool
-        if tool_name == "grievance_status" and self._grievance_status_url:
-            logger.info(f"🔧 Executing Grievance Status tool")
-            
-            try:
-                grievance_id = kwargs.get("grievance_id") or kwargs.get("query", "")
-                
-                if not grievance_id:
-                    return {
-                        "success": False,
-                        "error": "No grievance ID provided",
-                        "tool_name": tool_name,
-                        "provider": "grievance_status"
-                    }
-                
-                # Fetch status from backend
-                async with aiohttp.ClientSession() as session:
-                    status_url = f"{self._grievance_status_url}/{grievance_id}"
-                    async with session.get(status_url) as response:
-                        if response.status == 200:
-                            data = await response.json()
-                            logger.info(f"✅ Grievance status fetched for ID: {grievance_id}")
-                            logger.info(f"📄 Backend response: {data}")
-                            return {
-                                "success": True,
-                                "grievance_id": grievance_id,
-                                "status": data.get("status"),
-                                "result": data,
-                                "tool_name": tool_name,
-                                "provider": "grievance_status"
-                            }
-                        elif response.status == 404:
-                            logger.warning(f"⚠️ Grievance not found: {grievance_id}")
-                            return {
-                                "success": False,
-                                "error": f"Grievance with ID '{grievance_id}' not found",
-                                "tool_name": tool_name,
-                                "provider": "grievance_status"
-                            }
-                        else:
-                            error_text = await response.text()
-                            logger.error(f"❌ Grievance status fetch failed: {response.status}")
-                            return {
-                                "success": False,
-                                "error": f"Failed to fetch grievance status: {error_text}",
-                                "tool_name": tool_name,
-                                "provider": "grievance_status"
-                            }
-                
-            except Exception as e:
-                logger.error(f"❌ Grievance status tool error: {str(e)}")
-                return {
-                    "success": False,
-                    "error": f"Grievance status fetch failed: {str(e)}",
-                    "tool_name": tool_name,
-                    "provider": "grievance_status"
-                }
-        
         # Standard tool execution
         tool = self.get_tool(tool_name)
         if not tool:
@@ -1887,13 +1691,5 @@ class ToolManager:
                 logger.debug("     Closed QueryAgent")
             except Exception as e:
                 logger.warning(f"   ⚠️ Error closing QueryAgent: {str(e)}")
-        
-        # Cleanup GrievanceAgent
-        if self._grievance_agent:
-            try:
-                await self._grievance_agent.close()
-                logger.debug("     Closed GrievanceAgent")
-            except Exception as e:
-                logger.warning(f"   ⚠️ Error closing GrievanceAgent: {str(e)}")
         
         logger.info("  Tool cleanup complete")

@@ -216,16 +216,6 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logging.error(f"❌ Failed to initialize Redis MCP: {e}")
 
-    # Initialize Grievance tool
-    try:
-        grievance_initialized = await tool_manager.initialize_grievance_async()
-        if grievance_initialized:
-            logging.info("✅ Grievance tool initialized successfully")
-        else:
-            logging.warning("⚠️ Grievance tool not enabled (GRIEVANCE_ENABLED=false)")
-    except Exception as e:
-        logging.error(f"❌ Failed to initialize Grievance tool: {e}")
-
     # Initialize language detector if enabled
     language_detector_llm = None
     if config.language_detection_enabled:
