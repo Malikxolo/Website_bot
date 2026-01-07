@@ -164,7 +164,7 @@ class OptimizedAgent:
             # STEP 0: Language Detection Layer (if enabled)
             if self.language_detection_enabled:
                 logger.info(f"🌍 LANGUAGE DETECTION LAYER: Processing query...")
-                lang_result = await self._detect_and_translate(query)
+                lang_result = await self._detect_and_translate(query, chat_history)
                 detected_language = lang_result["detected_language"]
                 english_query = lang_result["english_translation"]
                 original_query = lang_result["original_query"]
@@ -218,21 +218,20 @@ class OptimizedAgent:
                 logger.info(f" Retrieved memories: {memories}")
                 analysis_start = datetime.now()
                 
-                # SOURCE-BASED ANALYSIS: WhatsApp uses routing layer, Website uses comprehensive
-                if source == "website":
-                    logger.info(f"💰 COST PATH: COMPREHENSIVE (Qwen CoT) - Website source")
-                    analysis = await self._comprehensive_analysis(processing_query, chat_history, memories)
-                else:
-                    # WhatsApp: Use routing layer to decide between simple and CoT
-                    logger.info(f"🧭 WHATSAPP SOURCE: Routing to determine analysis path...")
-                    routing_decision = await self._route_query(processing_query, chat_history, memories)
-                    
-                    if routing_decision["needs_cot"]:
+                # ROUTING LAYER: Decide analysis path for all sources
+                logger.info(f"🧭 ROUTING: Determining analysis path for {source} source...")
+                routing_decision = await self._route_query(processing_query, chat_history, memories)
+                
+                if routing_decision["needs_cot"]:
+                    if source == "whatsapp":
                         logger.info(f"💰 COST PATH: COT WHATSAPP (Nemotron CoT) - Complex query")
                         analysis = await self._simple_analysis(processing_query, chat_history, memories, use_cot=True)
-                    else:
-                        logger.info(f"💰 COST PATH: SIMPLE WHATSAPP (Llama Fast) - Simple query")
-                        analysis = await self._simple_analysis(processing_query, chat_history, memories, use_cot=False)
+                    else:  # website
+                        logger.info(f"💰 COST PATH: COMPREHENSIVE (Qwen CoT) - Complex query")
+                        analysis = await self._comprehensive_analysis(processing_query, chat_history, memories)
+                else:
+                    logger.info(f"💰 COST PATH: SIMPLE ANALYSIS - Simple query")
+                    analysis = await self._simple_analysis(processing_query, chat_history, memories, use_cot=False)
                 
                 analysis_time = (datetime.now() - analysis_start).total_seconds()
                 logger.info(f" Analysis completed in {analysis_time:.2f}s")
@@ -249,10 +248,6 @@ class OptimizedAgent:
             if expansion_reasoning:
                 logger.info(f"   🧠 Model Reasoning: {expansion_reasoning}")
             
-            business_opp = analysis.get('business_opportunity', {})
-            logger.info(f"   Business Confidence: {business_opp.get('composite_confidence', 0)}/100")
-            logger.info(f"   Engagement Level: {business_opp.get('engagement_level', 'none')}")
-            logger.info(f"   Signal Breakdown: {business_opp.get('signal_breakdown', {})}")
             logger.info(f"   Tools Selected: {analysis.get('tools_to_use', [])}")
             logger.info(f"   Response Strategy: {analysis.get('response_strategy', {}).get('personality', 'Unknown')}")
             
@@ -387,7 +382,6 @@ class OptimizedAgent:
                 "tool_results": tool_results,
                 "tools_used": analysis.get('tools_to_use', []),
                 "execution_mode": execution_mode,
-                "business_opportunity": analysis.get('business_opportunity', {}),
                 "analysis_cache_hit": bool(cached_analysis),
                 "analysis_path": analysis_path,
                 "tools_cache_hit": False,  # Tools are always executed fresh
@@ -441,13 +435,16 @@ class OptimizedAgent:
         Router layer: Decide if query needs Chain-of-Thought reasoning (CoT) or simple analysis
         Uses Meta Llama 3.3 70B for fast, cost-effective routing decision
         """
-        context = chat_history[-2:] if chat_history else []
+        formatted_history = self._format_chat_history(chat_history, max_messages=2)
         
         routing_prompt = f"""Analyze this query and decide if it needs deep Chain-of-Thought reasoning or simple analysis.
 
 USER QUERY: {query}
+
 LONG-TERM CONTEXT (Memories): {memories}
-CONVERSATION HISTORY: {context}
+
+CONVERSATION HISTORY (for context - check what was discussed before):
+{formatted_history}
 
 Your task: Determine query complexity level.
 
@@ -456,7 +453,6 @@ NEEDS DEEP REASONING (Chain-of-Thought) when query involves:
 - Conditional logic with dependencies (if/then/else scenarios)
 - Multi-task decomposition with sequential dependencies
 - Ambiguous intent requiring deep semantic analysis
-- Complex business opportunity assessment with nuanced signals
 - Queries asking for comparisons, alternatives, or multi-angle exploration
 - Strategic thinking or planning required
 
@@ -547,10 +543,37 @@ Return ONLY valid JSON:
         
         return guides.get(emotion, {}).get(intensity, "Be naturally helpful and friendly")
 
-    async def _detect_and_translate(self, query: str) -> Dict[str, str]:
+    def _format_chat_history(self, chat_history: List[Dict], max_messages: int = 4) -> str:
+        """Format chat history for inclusion in prompts
+        
+        Args:
+            chat_history: List of message dictionaries with 'role' and 'content'
+            max_messages: Maximum number of recent messages to include
+            
+        Returns:
+            Formatted string with "ROLE: content" format, one per line
+        """
+        if not chat_history:
+            return "No previous conversation."
+        
+        history_entries = []
+        for msg in chat_history[-max_messages:]:  # Get last N messages
+            role = msg.get('role', 'unknown').upper()
+            content = msg.get('content', '')
+            if content:  # Only add if there's actual content
+                history_entries.append(f"{role}: {content}")
+        
+        return "\n".join(history_entries) if history_entries else "No previous conversation."
+
+    async def _detect_and_translate(self, query: str, chat_history: List[Dict] = None) -> Dict[str, str]:
         """Detect language and translate to English if needed"""
         
+        formatted_history = self._format_chat_history(chat_history, max_messages=3)
+        
         detection_prompt = f"""Analyze this query and identify its language, then translate if needed.
+        
+CONVERSATION HISTORY (for context - check previous turns to understand follow-ups):
+{formatted_history}
 
 QUERY: "{query}"
 
@@ -628,23 +651,27 @@ Examples:
         """
         from datetime import datetime
         
-        context = chat_history[-4:] if chat_history else []
+        formatted_history = self._format_chat_history(chat_history, max_messages=10)
         current_date = datetime.now().strftime("%B %d, %Y")
         
-        analysis_prompt = f"""You are analyzing queries for Mochan-D - an AI chatbot solution that:
-- Automates customer support and sales (24/7 availability)
-- Works across multiple platforms (WhatsApp, Facebook, Instagram, etc.)
-- Uses RAG + Web Search for intelligent responses
-- Serves businesses of all sizes needing to scale customer communication
+        analysis_prompt = f"""You are analyzing queries for a helpful AI assistant that:
+- Provides comprehensive and accurate information
+- Uses RAG (knowledge base) + Web Search for intelligent responses
+- Assists users with various tasks and queries
+- Delivers clear, actionable, and helpful responses
+
+{self._get_tools_prompt_section()}
 
 DATE: {current_date}
+
+CONVERSATION HISTORY (for context - check previous turns to understand follow-ups):
+{formatted_history}
 
 USER'S LATEST QUERY (analyze THIS): "{query}"
 
 BACKGROUND CONTEXT (Long-term memories):
 {memories}
 
-{self._get_tools_prompt_section()}
 
 Perform ALL of the following analyses in ONE response:
 
@@ -680,73 +707,7 @@ Perform ALL of the following analyses in ONE response:
     - If YES (previous response exists): "User wants the previous assistant response translated to [language]"
     - If NO (no previous response): "User wants future responses in [language]"
 
-3. MOCHAN-D PRODUCT OPPORTUNITY ANALYSIS:
-    ⚠️ FIRST: Ask yourself - "Is the user seeking help for THEIR BUSINESS or for THEMSELVES as a consumer?"
-    Only detect business_opportunity if they are a business owner discussing business challenges.
-
-
-Does the user's query relate to problems that Mochan-D's AI chatbot solution can solve?
-
-
-   MOCHAN-D-SPECIFIC TRIGGERS (check for these pain points):
-   - Customer support automation needs
-   - High customer service costs or staff burden 
-   - Need for 24/7 customer availability
-   - Multiple messaging platform management difficulties (WhatsApp, Facebook, Instagram)
-   - Repetitive customer query handling
-   - Customer engagement/response time issues
-   - Integration needs with CRM/payment systems for customer communication
-   - Scaling customer communication challenges
-
-   CONTEXTUAL TRIGGERS (Score: 50-70):
-    - Mentions competitors
-    - Asks "how to improve..." business processes
-    - Growth/scaling discussions
-    - Team efficiency concerns
-    
-   EMOTIONAL CUES (Score: 40-60):
-   - Frustration → Empathy + solution
-   - Celebration → Join joy, suggest growth
-   - Worry → Reassurance + clarity
-   
-   Set business_opportunity.detected = true if query shows ANY of:
-   - User states a current problem/challenge
-   - User is actively seeking/evaluating solutions
-   - User expresses dissatisfaction with current situation
-   - User mentions "need", "looking for", "considering", "want to improve"
-
-   CONFIDENCE SCORING:
-   composite_confidence = (work_context + emotional_distress + solution_seeking + scale_scope) / 4
-   
-   - work_context: 0-100 (Business vs personal)
-   - emotional_distress: 0-100 (Frustration/stress level)
-   - solution_seeking: 0-100 (Actively looking for help?)
-   - scale_scope: 0-100 (Size/urgency of problem)
-   
-   Score Bands:
-   0-30: No business context → pure_empathy
-   31-50: Ambiguous → empathetic_probing
-   51-70: Possible → gentle_suggestion
-   71-85: Clear pain → soft_pitch
-   86-100: Hot lead → direct_consultation
-
-
-   DO NOT trigger business_opportunity.detected = true for:
-   - Pure research/comparison without context ("Compare X vs Y")
-   - Definition questions ("What is X")
-   - General knowledge inquiries
-   - Personal health, relationships, entertainment
-   - Weather, jokes, casual chat (unless leads to business context)
-   - Pet problems, family issues
-
-
-   If business opportunity detected:
-   - Set business_opportunity.detected = true
-
-   If query is about other business areas (accounting, inventory, website, etc.):
-   - Set business_opportunity.detected = false
-
-4. TOOL SELECTION FOR MULTI-TASK QUERIES:
+3. TOOL SELECTION FOR MULTI-TASK QUERIES:
 
    For EACH sub-task identified in step 1, select the most appropriate tool:
    
@@ -764,9 +725,8 @@ Does the user's query relate to problems that Mochan-D's AI chatbot solution can
      
     AFTER SELECTING ALL GENERAL TOOLS - APPLY RAG SELECTION (GLOBAL CHECK):
     Select `rag` if ANY of:
-    1. Any sub-task is directly ABOUT Mochan-D
-    2. OR business_opportunity.detected = true
-    3. OR web_search is selected for ANY sub-task
+    1. Any sub-task is directly about your knowledge base or requires internal information
+    2. OR web_search is selected for ANY sub-task
     
     If rag should be added, add ONE `rag` to tools_to_use
  
@@ -779,11 +739,11 @@ Does the user's query relate to problems that Mochan-D's AI chatbot solution can
    - Greetings, casual chat
    - General knowledge questions that don't require current information
 
-5. SENTIMENT & PERSONALITY:
+4. SENTIMENT & PERSONALITY:
    - User's emotional state (frustrated/excited/casual/urgent/confused)
-   - Best response personality (empathetic_friend/excited_buddy/helpful_dost/urgent_solver/patient_guide)
+   - Best response personality (empathetic_friend/excited_buddy/helpful_assistant/urgent_solver/patient_guide)
 
-6. TOOL ORCHESTRATION AND EXECUATION PLANNING - CAN DIFFERENT TOOLS RUN TOGETHER?
+5. TOOL ORCHESTRATION AND EXECUATION PLANNING - CAN DIFFERENT TOOLS RUN TOGETHER?
    
    Think about dependencies BETWEEN tool types (not within same tool type):
    
@@ -805,13 +765,13 @@ Does the user's query relate to problems that Mochan-D's AI chatbot solution can
     - Example:
     order: ["rag_0", "web_search_0", "calculator_0"]
     queries: {{
-        "rag_0": "Mochan-D pricing plans features",
-        "web_search_0": "AI chatbot market rates 2025",
+        "rag_0": "product pricing plans features",
+        "web_search_0": "market rates 2025",
         "calculator_0": "1500 * 12"
     }}
     
     Query optimization rules:
-    - RAG: "Mochan-D" + [specific topic from sub-task]
+    - RAG: [specific topic from sub-task]
     - Calculator: Extract numbers from sub-task, create valid Python expression
     - Web_search: Transform sub-task into focused search query, preserve qualifiers (when, how much, what type), add "2025" if time-sensitive
     - zapier_*, mongodb, redis: Use natural language with context from conversation history
@@ -819,11 +779,11 @@ Does the user's query relate to problems that Mochan-D's AI chatbot solution can
     Note: All web_search queries always run parallel among themselves.
    This is only about cross-tool dependencies (rag ↔ web_search ↔ calculator)
 
-7. Is this a follow-up query?
+6. Is this a follow-up query?
    - Look at conversation history: Does current query build on previous topics?
    - Follow-up = asking for details, clarification, or diving deeper into what was discussed
    - New query = completely different topic or no conversation history
-
+   
 Return ONLY valid JSON:
 {{
   "multi_task_analysis": {{
@@ -833,20 +793,6 @@ Return ONLY valid JSON:
   "is_follow_up": true or false,
   "semantic_intent": "what user wants",
   "expansion_reasoning": "kept simple - straightforward query",
-  "business_opportunity": {{
-    "detected": true or false,
-    "composite_confidence": 0-100,
-    "engagement_level": "direct_consultation|gentle_suggestion|empathetic_probing|pure_empathy",
-    "signal_breakdown": {{
-      "work_context": 0-100,
-      "emotional_distress": 0-100,
-      "solution_seeking": 0-100,
-      "scale_scope": 0-100
-    }},
-    "recommended_approach": "empathy_first|solution_focused|consultation_ready",
-    "pain_points": ["problem 1", "problem 2"],
-    "solution_areas": ["how Mochan-D helps"]
-  }},
   "tools_to_use": ["tool1", "tool2"],
   "tool_execution": {{
     "mode": "sequential|parallel",
@@ -865,7 +811,7 @@ Return ONLY valid JSON:
     "intensity": "low|medium|high"
   }},
   "response_strategy": {{
-    "personality": "empathetic_friend|excited_buddy|helpful_dost|urgent_solver|patient_guide",
+    "personality": "empathetic_friend|excited_buddy|helpful_assistant|urgent_solver|patient_guide",
     "length": "micro|short|medium|detailed",
     "tone": "friendly|professional|empathetic|excited"
   }},
@@ -880,8 +826,7 @@ Return ONLY valid JSON:
                 logger.info(f"💨 SIMPLE WHATSAPP ANALYSIS (Llama - Simple query)")
                 analysis_llm = self.simple_whatsapp_llm
             
-            messages = chat_history[-4:] if chat_history else []
-            messages.append({"role": "user", "content": analysis_prompt})
+            messages = [{"role": "user", "content": analysis_prompt}]
             
             response = await analysis_llm.generate(
                 messages,
@@ -906,29 +851,15 @@ Return ONLY valid JSON:
             "multi_task_analysis": {"multi_task_detected": False, "sub_tasks": []},
             "semantic_intent": query,
             "expansion_reasoning": "Fallback due to parse error",
-            "business_opportunity": {
-                "detected": False,
-                "composite_confidence": 0,
-                "engagement_level": "pure_empathy",
-                "signal_breakdown": {
-                    "work_context": 0,
-                    "emotional_distress": 0,
-                    "solution_seeking": 0,
-                    "scale_scope": 0
-                },
-                "recommended_approach": "empathy_first",
-                "pain_points": [],
-                "solution_areas": []
-            },
             "tools_to_use": [],
             "tool_execution": {"mode": "parallel", "order": [], "dependency_reason": ""},
             "enhanced_queries": {},
             "tool_reasoning": "Direct response needed",
             "sentiment": {"primary_emotion": "casual", "intensity": "medium"},
             "response_strategy": {
-                "personality": "helpful_dost",
+                "personality": "helpful_assistant",
                 "length": "medium",
-                "language": "hinglish",
+                "language": "english",
                 "tone": "friendly"
             }
         }
@@ -941,16 +872,19 @@ Return ONLY valid JSON:
         """
         from datetime import datetime
         
-        context = chat_history[-5:] if chat_history else []
+        formatted_history = self._format_chat_history(chat_history, max_messages=10)
         current_date = datetime.now().strftime("%B %d, %Y")
         
-        analysis_prompt = f"""You are analyzing a user query for Mochan-D as of {current_date} - an AI chatbot that automates customer support across WhatsApp, Facebook, Instagram with RAG and web search capabilities.
+        analysis_prompt = f"""You are analyzing a user query as of {current_date} - providing comprehensive assistance with RAG and web search capabilities.
 
 {self._get_tools_prompt_section()}
 
 CRITICAL: ONLY USE TOOLS FROM THE "AVAILABLE TOOLS" LIST ABOVE. Do NOT use any tools that are not explicitly listed. If a tool you want to use is not in the list, do not select it.
 
-USER QUERY: {query}
+CONVERSATION HISTORY (for context - check previous turns to understand follow-ups):
+{formatted_history}
+
+USER'S LATEST QUERY (analyze THIS): "{query}"
 
 LONG-TERM CONTEXT (Memories): {memories}
 
@@ -958,6 +892,7 @@ CRITICAL INSTRUCTION - DATA FRESHNESS:
 - Any information that is liable to change, USE web-search to validate that (BUT ONLY IF web_search is listed in Available Tools above).
 - For standard definitions and facts, use your base data. Based on that, expand on the dimensionality aspect to retrieve all that information at once.
 - Think deeply for every possibilities do not leave things by assuming anything
+
 CORE PRINCIPLE: Think like a world-class consultant.
 When someone asks for X, you don't just give X. You think: "What else do they need to make X truly successful?"
 
@@ -996,16 +931,7 @@ THINK THROUGH THESE QUESTIONS (use your intelligence, not rules):
    
    Use this expansion mindset for EVERY query.
 
-3. IS THIS A BUSINESS PROBLEM?
-   Think naturally: Does this query relate to challenges that an AI chatbot could solve?
-   - Customer communication problems?
-   - Need for automation or always-available support?
-   - Managing multiple platforms or scaling interactions?
-   
-   If yes → this is a business context 
-   If no → just answer the query directly
-
-4. MULTI-DIMENSIONAL TASK BREAKDOWN - FIND ALL THE HIDDEN ANGLES
+3. MULTI-DIMENSIONAL TASK BREAKDOWN - FIND ALL THE HIDDEN ANGLES
    
    Your job: Identify EVERY dimension of this query, including what user didn't explicitly say.
    
@@ -1031,7 +957,7 @@ THINK THROUGH THESE QUESTIONS (use your intelligence, not rules):
    Don't merge dimensions - keep each one focused and distinct.
    If you're generating less than 5 searches for a complex query, you're missing dimensions.
 
-5. HOW TO FORMAT YOUR QUERIES (CRITICAL):
+4. HOW TO FORMAT YOUR QUERIES (CRITICAL):
    
    For web_search queries:
    - Write like you're typing into Google: SHORT, keyword-focused
@@ -1049,13 +975,12 @@ THINK THROUGH THESE QUESTIONS (use your intelligence, not rules):
 
    AFTER SELECTING ALL TOOLS - APPLY RAG CHECK:
    Add `rag` to tools_to_use if ANY of:
-   1. Any dimension is directly ABOUT Mochan-D
-   2. OR business_opportunity.detected = true
-   3. OR web_search is selected for ANY dimension
+   1. Any dimension is directly about your knowledge base or requires internal information
+   2. OR web_search is selected for ANY dimension
    
    If triggered, add ONE `rag` to your tools_to_use list.
 
-6. TOOL ORCHESTRATION - CAN DIFFERENT TOOLS RUN TOGETHER?
+5. TOOL ORCHESTRATION - CAN DIFFERENT TOOLS RUN TOGETHER?
    
    Think about dependencies BETWEEN tool types (not within same tool type):
    
@@ -1070,13 +995,13 @@ THINK THROUGH THESE QUESTIONS (use your intelligence, not rules):
    Note: All web_search queries always run parallel among themselves.
    This is only about cross-tool dependencies (rag ↔ web_search ↔ calculator ↔ zapier_*)
 
-7. HOW SHOULD THE RESPONSE FEEL?
+6. HOW SHOULD THE RESPONSE FEEL?
    Based on the user's tone and needs:
    - What personality would work best? (empathetic, professional, casual, excited, urgent)
    - How much detail do they need? (brief, moderate, comprehensive)
    - What language style fits? (formal english, casual english, hinglish)
 
-8. IS THIS A FOLLOW-UP QUERY?
+7. IS THIS A FOLLOW-UP QUERY?
    Look at CONVERSATION HISTORY above:
    - Does the current query build on previous topics discussed?
    - Is user asking for details, clarification, or diving deeper into what was already talked about?
@@ -1101,20 +1026,6 @@ OUTPUT THIS EXACT JSON STRUCTURE:
   "is_follow_up": true or false,
   "semantic_intent": "clear description of overall user goal",
   "expansion_reasoning": "your thought process why keeping simple OR why adding more searches",
-  "business_opportunity": {{
-    "detected": true or false,
-    "composite_confidence": 0-100,
-    "engagement_level": "direct_consultation|gentle_suggestion|empathetic_probing|pure_empathy",
-    "signal_breakdown": {{
-      "work_context": 0-100,
-      "emotional_distress": 0-100,
-      "solution_seeking": 0-100,
-      "scale_scope": 0-100
-    }},
-    "recommended_approach": "empathy_first|solution_focused|consultation_ready",
-    "pain_points": ["specific problem 1", "specific problem 2"],
-    "solution_areas": ["how Mochan-D helps 1", "solution 2"]
-  }},
   "tools_to_use": ["tool1", "tool2"],
   "tool_execution": {{
     "mode": "sequential|parallel",
@@ -1133,7 +1044,7 @@ OUTPUT THIS EXACT JSON STRUCTURE:
     "intensity": "low|medium|high"
   }},
   "response_strategy": {{
-    "personality": "empathetic_friend|excited_buddy|helpful_dost|urgent_solver|patient_guide",
+    "personality": "empathetic_friend|excited_buddy|helpful_assistant|urgent_solver|patient_guide",
     "length": "micro|short|medium|detailed",
     "language": "hinglish|english|professional|casual",
     "tone": "friendly|professional|empathetic|excited"
@@ -1146,17 +1057,13 @@ Now analyze: {query}
 Think through each question naturally, then return ONLY the JSON. No other text."""
 
         try:
-            # messages = []
-            
             # Simple system prompt for thinking models
             system_prompt = f"""You are analyzing queries as of {current_date}. Think step by step, then output valid JSON only."""
             
-            
-            messages = chat_history[-4:] if chat_history else []
-            messages.append({"role": "user", "content": analysis_prompt})
+            messages = [{"role": "user", "content": analysis_prompt}]
             
             response = await self.brain_llm.generate(
-                messages=[{"role": "user", "content": analysis_prompt}],
+                messages,
                 system_prompt=system_prompt,
                 temperature=0.1,
                 max_tokens=16000
@@ -1466,15 +1373,15 @@ Return ONLY the natural language instruction. Be specific about which resource t
 
                 Example 3 (Comparison):
                 Query: "compare competitors"
-                Previous: "Mochan-D is a customer support chatbot for WhatsApp"
-                Analysis: User wants competitors of customer support chatbots
-                Output: customer support chatbot WhatsApp competitors 2025
+                Previous: "ProductX is an AI assistant platform"
+                Analysis: User wants competitors of AI assistant platforms
+                Output: AI assistant platform competitors 2025
 
                 Example 4 (Product Info):
                 Query: "compare pricing"
-                Previous: "ProductX is an AI chatbot builder platform"
-                Analysis: User wants pricing comparison for AI chatbot builders
-                Output: AI chatbot builder pricing comparison 2025
+                Previous: "ProductX is a software platform"
+                Analysis: User wants pricing comparison for similar platforms
+                Output: software platform pricing comparison 2025
 
                 YOUR TASK:
                 Generate the next search query based on the analysis above.
@@ -1500,7 +1407,7 @@ Return ONLY the natural language instruction. Be specific about which resource t
 
     
     async def _generate_response(self, query: str, analysis: Dict, tool_results: Dict, chat_history: List[Dict], memories: str = "", mode: str = "", source: Optional[str] = None, detected_language: str = "english", original_query: str = None) -> str:
-        """Generate response with simple business mode switching like old system"""
+        """Generate response based on user query and tool results"""
         
         # Use original query if provided, otherwise use the query parameter
         if original_query is None:
@@ -1513,13 +1420,8 @@ Return ONLY the natural language instruction. Be specific about which resource t
         
         # Extract key elements
         intent = analysis.get('semantic_intent', '')
-        business_opp = analysis.get('business_opportunity', {})
         sentiment = analysis.get('sentiment', {})
         strategy = analysis.get('response_strategy', {})
-        
-        # Simple binary business mode logic (like your old system)
-        business_detected = business_opp.get('detected', False)
-        conversation_mode = "Smart Business Friend" if business_detected else "Casual Dost"
         
         # Actually USE the sentiment guide you built
         sentiment_guidance = self._build_sentiment_language_guide(sentiment)
@@ -1527,11 +1429,9 @@ Return ONLY the natural language instruction. Be specific about which resource t
         # Enhanced logging
         logger.info(f"  RESPONSE GENERATION INPUTS:")
         logger.info(f"   Intent: {intent}")
-        logger.info(f"   Business Opportunity Detected: {business_detected}")
-        logger.info(f"   Conversation Mode: {conversation_mode}")
         logger.info(f"   User Emotion: {sentiment.get('primary_emotion', 'casual')}")
         logger.info(f"   Sentiment Guidance: {sentiment_guidance}")
-        logger.info(f"   Response Personality: {strategy.get('personality', 'helpful_dost')}")
+        logger.info(f"   Response Personality: {strategy.get('personality', 'helpful_assistant')}")
         logger.info(f"   Response Length: {strategy.get('length', 'medium')}")
         logger.info(f"   Language Style: {strategy.get('detectedlanguage', 'english')}")
         
@@ -1539,17 +1439,18 @@ Return ONLY the natural language instruction. Be specific about which resource t
         tool_data = self._format_tool_results(tool_results)
         logger.info(f" FORMATTED TOOL DATA: {len(tool_data)} chars")
         
-        context = chat_history[-5:] if chat_history else []
-        # Build memory context to avoid repetition
-        recent_phrases = self._extract_recent_phrases(chat_history)
-        logger.info(f" RECENT PHRASES TO AVOID: {recent_phrases}")
+        formatted_history = self._format_chat_history(chat_history, max_messages=10)
         
         logger.info(f" PROMPT SELECTION DEBUG: mode='{mode}' (type: {type(mode)}), checking if mode == 'transformative'")
         if mode == "transformative":
             logger.info(f" USING TRANSFORMATIVE PROMPT (mode: {mode})")
             response_prompt = f"""You are a helpful AI assistant. Your purpose is to provide accurate, comprehensive, and useful responses.
-
+            
+            CONVERSATION HISTORY (for context - check what was discussed before):
+            {formatted_history}
+            
             ORIGINAL USER QUERY: {query}
+            
             UNDERSTOOD AS: {intent}
 
             (When these differ, pay attention to the original wording - it shows what the user is specifically referring to)
@@ -1630,120 +1531,91 @@ Return ONLY the natural language instruction. Be specific about which resource t
 
             Provide your comprehensive response now:"""
         else:
-            logger.info(f" USING DEFAULT MOCHAN-D PROMPT (mode: {mode})")
-            response_prompt = f"""You are Mochan-D (Mochand Dost) - an AI companion who's equal parts:
-            - Helpful friend (dost) who genuinely cares
-            - Smart business consultant who spots opportunities  
-            - Natural conversationalist who builds relationships
-            - Clever sales agent who never feels pushy
-            - Analytical problem-solver who adds real value
-            - Structure your responses such that they answer the user's query fully while keeping it short and concise.
-            - For complex queries, break down your response into clear sections with headers and bullet points.
-            - Keep your response under 350 characters.
-            YOUR PERSONALITY:
-
-            Base Mode (Casual Dost): Warm, friendly, picks up emotional cues, conversational not robotic
-            Maintain warmth and friendliness while using respectful language:
-            - Speak like a professional friend, not a street buddy
-            - Use respectful pronouns and verb forms in Hindi/Urdu
+            logger.info(f" USING DEFAULT ASSISTANT PROMPT (mode: {mode})")
+            response_prompt = f"""You are a helpful AI assistant providing comprehensive and accurate information.
             
-            Business Mode (Smart Consultant): Maintains friendly tone + strategic depth, spots pain points, connects to solutions naturally (NEVER forced)
+YOUR PERSONALITY:
+- Warm, friendly, and approachable
+- Professional yet conversational
+- Clear and helpful communicator
+- Empathetic to user needs
             
-            CRITICAL - LANGUAGE OVERRIDE:
-            User's current detected language: {detected_language}
+CRITICAL - LANGUAGE OVERRIDE:
+User's current detected language: {detected_language}
 
-            Respond ONLY in this detected language. Match the exact script the user just used.
+Respond ONLY in this detected language. Match the exact script the user just used.
 
-            If the user switched language from previous messages, you MUST switch with them.
-            Ignore all conversation history language patterns.
-            Ignore all memory language patterns.
+If the user switched language from previous messages, you MUST switch with them.
+Ignore all conversation history language patterns.
+Ignore all memory language patterns.
 
-            This rule overrides everything else - personality, history, memories, all other instructions.
+This rule overrides everything else - personality, history, memories, all other instructions.
 
-            CURRENT CONVERSATION CONTEXT:
-            - User Intent: {intent}
-            - Business Status: {business_detected}
-                {f"- Confidence: {business_opp.get('composite_confidence', 0)}/100" if business_detected else ""}
-                {f"- Pain Points: {business_opp.get('pain_points', [])}" if business_detected else ""}
-                {f"- Solutions: {business_opp.get('solution_areas', [])}" if business_detected else ""}
-            - Conversation Mode: {conversation_mode}
-            - User Emotion: {sentiment.get('primary_emotion', 'casual')} ({sentiment.get('intensity', 'medium')})
-            - User Sentiment Guide: {sentiment_guidance}
+CURRENT CONVERSATION CONTEXT:
+- User Intent: {intent}
+- User Emotion: {sentiment.get('primary_emotion', 'casual')} ({sentiment.get('intensity', 'medium')})
+- User Sentiment Guide: {sentiment_guidance}
 
-            DATA AUTHORITY CONTEXT:
+DATA AUTHORITY CONTEXT:
 
-            When data is presented as WEB_SEARCH or RAG results:
-            - This represents CURRENT REALITY (not training memory)
-            - This is what exists in the world RIGHT NOW
-            - Your training knowledge is a backup reference only
+When data is presented as WEB_SEARCH or RAG results:
+- This represents CURRENT REALITY (not training memory)
+- This is what exists in the world RIGHT NOW
+- Your training knowledge is a backup reference only
 
-            Build your response using the tool data as your source of truth
+Build your response using the tool data as your source of truth
             
-            TASK: When the user's query is an explicit action (summarize, extract, analyze, compare), DO THAT TASK using the available data. Don't ask for clarification on what to do - do it naturally.
+TASK: When the user's query is an explicit action (summarize, extract, analyze, compare), DO THAT TASK using the available data. Don't ask for clarification on what to do - do it naturally.
             
-            AVAILABLE DATA TO USE NATURALLY:
-            {tool_data}
+AVAILABLE DATA TO USE NATURALLY:
+{tool_data}
             
-            NOTE: Provide links if web search is used (Use a view friendly format).
+NOTE: Provide links if web search is used (Use a view friendly format).
+
+CONVERSATION HISTORY (for context - check what was discussed before):
+{formatted_history}
+
+LONG-TERM CONTEXT (Memories use if relevant): {memories}
+
+RESPONSE REQUIREMENTS:
+- Personality: {strategy.get('personality', 'helpful_assistant')}
+- Length: {strategy.get('length', 'medium')}            
+- Tone: {strategy.get('tone', 'friendly')}
+
+🎯 RESPONSE RULES:
+
+CORE PRINCIPLES:
+1. Start with value, not preamble. Jump directly into insights without any conversational setup.
+2. NEVER begin your response by restating, echoing, or mentioning what the user asked about. Go straight to the substantive information.
+3. NEVER announce tool usage ("Let me search...", "I found...")
+4. Match emotional energy PRECISELY using sentiment guide
+5. Be genuinely helpful and informative
+
+OPENING LINE RULES:
+- DO: Start with direct insights, facts, or analysis
+- DON'T: Reference the user's query topic in your first sentence
+- The user knows what they asked - deliver the answer immediately
+
+COMMUNICATION STYLE:
+- Clear and concise
+- Naturally incorporate data
+- Professional but friendly
+- Empathetic when appropriate
+- Direct and actionable
+
+CRITICAL DON'TS:
+❌ Repeat user's words
+❌ Corporate jargon
+❌ Unnecessary preamble
+❌ Forced responses
             
-            LONG-TERM CONTEXT (Memories use if relevant): {memories}
+✅ DO: Be genuinely helpful, provide accurate information, use data naturally, match communication style, create value in every response
 
-            RESPONSE REQUIREMENTS
-            - Personality: {strategy.get('personality', 'helpfuldost')}
-            - Length: {strategy.get('length', 'medium')}            
-            - Tone: {strategy.get('tone', 'friendly')}
+USER QUERY: {original_query}
 
-            🎯 RESPONSE RULES:
+{'WHATSAPP CONTEXT: You are communicating via WhatsApp where brevity is essential for mobile engagement. ' + ('This is a FOLLOW-UP query - user wants depth on previous discussion. Provide 350-450 character response with comprehensive insights, examples, and actionable details. Use the space fully.' if analysis.get('is_follow_up', False) else 'This is an INITIAL query - create engagement spark. Compress response to 200-250 characters maximum - deliver the most critical insight that invites further conversation. Platform constraints override data volume.') if source == 'whatsapp' else ''}
 
-            CORE PRINCIPLES:
-            1. Start with value, not preamble. Jump directly into insights without any conversational setup.
-            2. NEVER begin your response by restating, echoing, or mentioning what the user asked about. Go straight to the substantive information.
-            3. NEVER announce tool usage ("Let me search...", "I found...")
-            4. Match emotional energy PRECISELY using sentiment guide
-            5. Stay in character as their dost
-
-            OPENING LINE RULES:
-            - DO: Start with direct insights, facts, or analysis
-            - DON'T: Reference the user's query topic in your first sentence
-            - The user knows what they asked - deliver the answer immediately
-            
-            BUSINESS OPPORTUNITY HANDLING:
-
-            NO Opportunity (0-30): Pure friend mode, NO sales, just helpful
-
-            LOW Opportunity (31-50): Empathetic probing - address query, then ONE gentle exploratory question
-
-            MEDIUM Opportunity (51-70): Gentle suggestion - solve query fully, acknowledge challenge, drop subtle hint, ask ONE question
-            Example: "Manual processes are tough. We help businesses with exactly this. What's your biggest bottleneck?"
-
-            HIGH Opportunity (71-85): Soft pitch - solve query, naturally connect pain to Mochan-D, share ONE capability, invite to learn more
-            Example: "That ticket chaos is real, yaar. Mochan-D automates these 24/7 while staying personal. Want to see how it works for businesses like yours?"
-
-            VERY HIGH Opportunity (86-100): Direct consultation - address pain immediately, clear value prop, focus on their ROI, create urgency through value, clear CTA
-            Example: "Losing deals to faster competitors - that's money on the table, bhai. Mochan-D gives 24/7 sales with AI that learns YOUR business. Should I show you the setup?"
-
-            SALES TECHNIQUES:
-            - Empathy Hook: "Sounds like..." / "That's rough, yaar..."
-            - Correlation Weave: Natural segue from their world to solution
-            - Social Proof: "A lot of startups face this..."
-            - ROI Translator: Features → their specific benefits
-            - Assumptive Consultant: "How many touchpoints juggling?"
-
-            CRITICAL DON'TS:
-            ❌ Repeat user's words
-            ❌ Corporate jargon
-            ❌ Sound desperate/pushy
-            ❌ Force Mochan-D if no opportunity
-            ❌ Multiple questions (1 max)
-            
-            ✅ DO: Sound like smart friend who knows solutions, build relationships, use data invisibly, match communication style, create value even if no sale today
-
-            USER QUERY: {original_query}
-
-            {'WHATSAPP CONTEXT: You are communicating via WhatsApp where brevity is essential for mobile engagement. ' + ('This is a FOLLOW-UP query - user wants depth on previous discussion. Provide 350-450 character response with comprehensive insights, examples, and actionable details. Use the space fully.' if analysis.get('is_follow_up', False) else 'This is an INITIAL query - create engagement spark. Compress response to 200-250 characters maximum - deliver the most critical insight that invites further conversation. Platform constraints override data volume.') if source == 'whatsapp' else ''}
-
-            NOW RESPOND as Mochand Dost in {conversation_mode} mode. Be natural, helpful, strategic, human. If business opportunity exists, weave it like a skilled storyteller - make them see value without feeling sold to. If casual chat, be the best dost ever.
-            Remember: You're building relationships that could turn into business. Play it smart, smooth, genuine."""
+NOW RESPOND as a helpful assistant. Be natural, informative, empathetic, and genuinely valuable."""
         
         
         try:
@@ -1760,8 +1632,8 @@ Return ONLY the natural language instruction. Be specific about which resource t
             logger.info(f" CALLING HEART LLM for response generation...")
             logger.info(f" Max tokens: {max_tokens}, Temperature: 0.4")
             
-            messages = chat_history[-4:] if chat_history else []
-            messages.append({"role": "user", "content": response_prompt})
+            messages = [{"role": "user", "content": response_prompt}]
+            
             if language in SARVAM_SUPPORTED_LANGUAGES:
                 response = await self.indic_llm.generate(
                     messages,
@@ -2028,23 +1900,6 @@ Return ONLY the natural language instruction. Be specific about which resource t
         
         return final_formatted
 
-
-    def _extract_recent_phrases(self, chat_history: List[Dict]) -> List[str]:
-        """Extract recent phrases to avoid repetition"""
-        if not chat_history:
-            return []
-        
-        phrases = []
-        for msg in chat_history[-4:]:
-            if msg.get('role') == 'assistant' or 'response' in msg:
-                content = msg.get('content', msg.get('response', ''))
-                # Get first 30 chars of each sentence
-                sentences = content.split('.')
-                for sentence in sentences[:2]:
-                    if sentence.strip():
-                        phrases.append(sentence.strip()[:30])
-        
-        return phrases[-5:] if phrases else []
     
     def _extract_json(self, response: str) -> str:
         """Extract JSON from LLM response (handles thinking models)"""
