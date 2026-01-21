@@ -11,12 +11,12 @@ import asyncio
 import uuid
 import re
 import os
-from typing import Dict, List, Any, Optional
+from typing import Dict, List, Any, Optional, AsyncGenerator
 from datetime import datetime
 from dotenv import load_dotenv
 load_dotenv()
 from os import getenv
-from mem0 import AsyncMemory
+# from mem0 import AsyncMemory
 import time
 from functools import partial
 from .config import AddBackgroundTask, memory_config, SARVAM_SUPPORTED_LANGUAGES
@@ -41,7 +41,7 @@ class OptimizedAgent:
         self.tool_manager = tool_manager
         # Include Zapier, MongoDB, Redis tools if available
         self.available_tools = tool_manager.get_available_tools(include_zapier=True, include_mongodb=True, include_redis=True)
-        self.memory = AsyncMemory(memory_config)
+        # self.memory = AsyncMemory(memory_config)
         self.task_queue: asyncio.Queue["AddBackgroundTask"] = asyncio.Queue()
         self._worker_started = False
         
@@ -187,34 +187,35 @@ class OptimizedAgent:
                 analysis = cached_analysis
                 analysis_time = 0.0  # Cache hit = instant
             else:
-                # Retrieve memories
-                eli = time.time()
-                memory_results = await self.memory.search(processing_query[:100], user_id=user_id, limit=5)
-                logger.info(f" Memory retrieval took {time.time() - eli:.2f}s")
-                # Detailed mem0 logging
-                logger.info(f"🧠 MEM0 SEARCH RESULTS:")
-                logger.info(f"   Query: '{query[:50]}...'")
-                logger.info(f"   User ID: {user_id}")
-                logger.info(f"   Raw results type: {type(memory_results)}")
-                logger.info(f"   Results keys: {memory_results.keys() if isinstance(memory_results, dict) else 'N/A'}")
-                logger.info(f"   Total results count: {len(memory_results.get('results', [])) if isinstance(memory_results, dict) else 0}")
-                
-                # Log each individual memory
-                if isinstance(memory_results, dict) and 'results' in memory_results:
-                    for idx, item in enumerate(memory_results.get('results', [])):
-                        logger.info(f"   Memory {idx + 1}:")
-                        logger.info(f"      Content: {item.get('memory', 'N/A')}")
-                        logger.info(f"      Score: {item.get('score', 'N/A')}")
-                        logger.info(f"      Metadata: {item.get('metadata', {})}")
-                else:
-                    logger.info(f"   ⚠️ No results or unexpected format")
-                
-                memories = "\n".join([
-                    f"- {item['memory']}" 
-                    for item in memory_results.get("results", []) 
-                    if item.get("memory")
-                ]) or "No previous context."
+                # Retrieve memories - DISABLED
+                # eli = time.time()
+                # memory_results = await self.memory.search(processing_query[:100], user_id=user_id, limit=5)
+                # logger.info(f" Memory retrieval took {time.time() - eli:.2f}s")
+                # # Detailed mem0 logging
+                # logger.info(f"🧠 MEM0 SEARCH RESULTS:")
+                # logger.info(f"   Query: '{query[:50]}...'")
+                # logger.info(f"   User ID: {user_id}")
+                # logger.info(f"   Raw results type: {type(memory_results)}")
+                # logger.info(f"   Results keys: {memory_results.keys() if isinstance(memory_results, dict) else 'N/A'}")
+                # logger.info(f"   Total results count: {len(memory_results.get('results', [])) if isinstance(memory_results, dict) else 0}")
+                # 
+                # # Log each individual memory
+                # if isinstance(memory_results, dict) and 'results' in memory_results:
+                #     for idx, item in enumerate(memory_results.get('results', [])):
+                #         logger.info(f"   Memory {idx + 1}:")
+                #         logger.info(f"      Content: {item.get('memory', 'N/A')}")
+                #         logger.info(f"      Score: {item.get('score', 'N/A')}")
+                #         logger.info(f"      Metadata: {item.get('metadata', {})}")
+                # else:
+                #     logger.info(f"   ⚠️ No results or unexpected format")
+                # 
+                # memories = "\n".join([
+                #     f"- {item['memory']}" 
+                #     for item in memory_results.get("results", []) 
+                #     if item.get("memory")
+                # ]) or "No previous context."
 
+                memories = "No previous context."
                 logger.info(f" Retrieved memories: {memories}")
                 analysis_start = datetime.now()
                 
@@ -303,31 +304,32 @@ class OptimizedAgent:
             
             # Get memories for response generation if not cached
             if not cached_analysis:
-                memory_results = await self.memory.search(processing_query, user_id=user_id, limit=5)
+                # memory_results = await self.memory.search(processing_query, user_id=user_id, limit=5)
                 
-                # Detailed mem0 logging
-                logger.info(f"🧠 MEM0 SEARCH RESULTS (Response Generation Path):")
-                logger.info(f"   Query: '{query[:50]}...'")
-                logger.info(f"   User ID: {user_id}")
-                logger.info(f"   Raw results type: {type(memory_results)}")
-                logger.info(f"   Results keys: {memory_results.keys() if isinstance(memory_results, dict) else 'N/A'}")
-                logger.info(f"   Total results count: {len(memory_results.get('results', [])) if isinstance(memory_results, dict) else 0}")
-                
-                # Log each individual memory
-                if isinstance(memory_results, dict) and 'results' in memory_results:
-                    for idx, item in enumerate(memory_results.get('results', [])):
-                        logger.info(f"   Memory {idx + 1}:")
-                        logger.info(f"      Content: {item.get('memory', 'N/A')}")
-                        logger.info(f"      Score: {item.get('score', 'N/A')}")
-                        logger.info(f"      Metadata: {item.get('metadata', {})}")
-                else:
-                    logger.info(f"   ⚠️ No results or unexpected format")
-                
-                memories = "\n".join([
-                    f"- {item['memory']}" 
-                    for item in memory_results.get("results", []) 
-                    if item.get("memory")
-                ]) or "No previous context."
+                # # Detailed mem0 logging
+                # logger.info(f"🧠 MEM0 SEARCH RESULTS (Response Generation Path):")
+                # logger.info(f"   Query: '{query[:50]}...'")
+                # logger.info(f"   User ID: {user_id}")
+                # logger.info(f"   Raw results type: {type(memory_results)}")
+                # logger.info(f"   Results keys: {memory_results.keys() if isinstance(memory_results, dict) else 'N/A'}")
+                # logger.info(f"   Total results count: {len(memory_results.get('results', [])) if isinstance(memory_results, dict) else 0}")
+                # 
+                # # Log each individual memory
+                # if isinstance(memory_results, dict) and 'results' in memory_results:
+                #     for idx, item in enumerate(memory_results.get('results', [])):
+                #         logger.info(f"   Memory {idx + 1}:")
+                #         logger.info(f"      Content: {item.get('memory', 'N/A')}")
+                #         logger.info(f"      Score: {item.get('score', 'N/A')}")
+                #         logger.info(f"      Metadata: {item.get('metadata', {})}")
+                # else:
+                #     logger.info(f"   ⚠️ No results or unexpected format")
+                # 
+                # memories = "\n".join([
+                #     f"- {item['memory']}" 
+                #     for item in memory_results.get("results", []) 
+                #     if item.get("memory")
+                # ]) or "No previous context."
+                memories = "No previous context."
             else:
                 memories = "No previous context."
             
@@ -343,15 +345,15 @@ class OptimizedAgent:
                 original_query=original_query  # Pass original query
             )
             
-            await self.task_queue.put(
-                AddBackgroundTask(
-                    func=partial(self.memory.add),
-                    params=(
-                        [{"role": "user", "content": original_query}, {"role": "assistant", "content": final_response}],
-                        user_id,
-                    ),
-                )
-            )
+            # await self.task_queue.put(
+            #     AddBackgroundTask(
+            #         func=partial(self.memory.add),
+            #         params=(
+            #             [{"role": "user", "content": original_query}, {"role": "assistant", "content": final_response}],
+            #             user_id,
+            #         ),
+            #     )
+            # )
             response_time = (datetime.now() - response_start).total_seconds()
             logger.info(f" Response generated in {response_time:.2f}s")
             
@@ -1960,3 +1962,375 @@ NOW RESPOND as a helpful assistant. Be natural, informative, empathetic, and gen
         response = response.strip()
         
         return response
+
+    async def _generate_response_streaming(self, query: str, analysis: Dict, tool_results: Dict, 
+                                           chat_history: List[Dict], memories: str = "", mode: str = "", 
+                                           source: Optional[str] = None, detected_language: str = "english", 
+                                           original_query: str = None) -> AsyncGenerator[str, None]:
+        """Stream response generation - yields text chunks"""
+        
+        if original_query is None:
+            original_query = query
+
+        logger.info(f"📝 STREAMING RESPONSE GENERATION: mode='{mode}', source='{source}'")
+        
+        intent = analysis.get('semantic_intent', '')
+        sentiment = analysis.get('sentiment', {})
+        strategy = analysis.get('response_strategy', {})
+        sentiment_guidance = self._build_sentiment_language_guide(sentiment)
+        tool_data = self._format_tool_results(tool_results)
+        formatted_history = self._format_chat_history(chat_history, max_messages=10)
+        
+        # Build prompt (same as _generate_response)
+        if mode == "transformative":
+            logger.info(f" USING TRANSFORMATIVE PROMPT (mode: {mode})")
+            response_prompt = f"""You are a helpful AI assistant. Your purpose is to provide accurate, comprehensive, and useful responses.
+            
+            CONVERSATION HISTORY (for context - check what was discussed before):
+            {formatted_history}
+            
+            ORIGINAL USER QUERY: {query}
+            
+            UNDERSTOOD AS: {intent}
+
+            (When these differ, pay attention to the original wording - it shows what the user is specifically referring to)
+
+            CRITICAL - DATA USAGE:
+            - RAG results = User's uploaded documents (PRIMARY SOURCE - use these fully)
+            - WEB_SEARCH results = Current internet information
+            - MongoDB/Zapier/Redis results = Action status (SUCCESS/ERROR/NEEDS CLARIFICATION)
+            - Your training knowledge = Use ONLY as backup when no data provided
+
+            ALWAYS prioritize the provided data as your source of truth.
+
+            AVAILABLE DATA:
+            {tool_data}
+            
+            LONG-TERM CONTEXT (Memories use if relevant): {memories}
+            
+            TASK HANDLING INSTRUCTIONS:
+
+            When user asks you to SUMMARIZE:
+            - Read ALL the provided data carefully
+            - Extract every key point, main concept, and important detail
+            - Structure your summary logically: Overview → Main Points → Key Takeaways
+            - Be comprehensive - cover all major aspects, not just 2-3 lines
+            - Don't skip sections or rush through content
+
+            When user asks you to IMPROVE/REVIEW/CRITIQUE:
+            - Analyze the ACTUAL content from the data provided
+            - Identify what's present and what's missing
+            - Give SPECIFIC suggestions with concrete examples
+            - Point to exact sections that need changes
+            - Structure: Current State → Issues Found → Specific Improvements
+            - Don't give generic advice - be actionable and detailed
+
+            When user asks you to ANALYZE/COMPARE:
+            - Break down information systematically
+            - Compare different aspects when multiple sources exist
+            - Provide insights and draw connections, not just facts
+            - Highlight patterns, similarities, and differences
+
+            When user asks QUESTIONS:
+            - Answer directly and thoroughly using the data
+            - Support your answer with evidence from the data
+            - Be complete but stay focused on what was asked
+
+            For GENERAL QUERIES:
+            - Be helpful, clear, and informative
+            - Use available data naturally in your response
+            - Match the depth and detail user expects
+
+            RESPONSE REQUIREMENTS:
+
+            LENGTH: Be comprehensive and thorough
+            - Don't artificially limit your response
+            - If summarizing long documents, give a complete summary
+            - If analyzing content, cover all relevant angles
+            - If providing suggestions, list everything important
+
+            STRUCTURE: Use clear formatting
+            - Headers and subheaders for organization
+            - Bullet points for lists and key points
+            - Examples and specifics when helpful
+            - Logical flow from start to finish
+
+            TONE: Professional yet approachable
+            - Clear and easy to understand
+            - Friendly but focused
+            - Helpful without being condescending
+
+            CRITICAL RULES:
+            1. USE ALL relevant data provided (especially RAG content - it's what user uploaded)
+            2. DO the complete task (no partial answers or cutting it short)
+            3. BE SPECIFIC - cite actual content, give concrete examples
+            4. NO selling or pitching anything
+            5. DON'T skip content because of length - be thorough
+
+            USER QUERY: {query}
+
+            Provide your comprehensive response now:"""
+        else:
+            logger.info(f" USING DEFAULT ASSISTANT PROMPT (mode: {mode})")
+            response_prompt = f"""You are a helpful AI assistant providing comprehensive and accurate information.
+            
+YOUR PERSONALITY:
+- Warm, friendly, and approachable
+- Professional yet conversational
+- Clear and helpful communicator
+- Empathetic to user needs
+            
+CRITICAL - LANGUAGE OVERRIDE:
+User's current detected language: {detected_language}
+
+Respond ONLY in this detected language. Match the exact script the user just used.
+
+If the user switched language from previous messages, you MUST switch with them.
+Ignore all conversation history language patterns.
+Ignore all memory language patterns.
+
+This rule overrides everything else - personality, history, memories, all other instructions.
+
+CURRENT CONVERSATION CONTEXT:
+- User Intent: {intent}
+- User Emotion: {sentiment.get('primary_emotion', 'casual')} ({sentiment.get('intensity', 'medium')})
+- User Sentiment Guide: {sentiment_guidance}
+
+DATA AUTHORITY CONTEXT:
+
+When data is presented as WEB_SEARCH or RAG results:
+- This represents CURRENT REALITY (not training memory)
+- This is what exists in the world RIGHT NOW
+- Your training knowledge is a backup reference only
+
+Build your response using the tool data as your source of truth
+            
+TASK: When the user's query is an explicit action (summarize, extract, analyze, compare), DO THAT TASK using the available data. Don't ask for clarification on what to do - do it naturally.
+            
+AVAILABLE DATA TO USE NATURALLY:
+{tool_data}
+            
+NOTE: Provide links if web search is used (Use a view friendly format).
+
+CONVERSATION HISTORY (for context - check what was discussed before):
+{formatted_history}
+
+LONG-TERM CONTEXT (Memories use if relevant): {memories}
+
+RESPONSE REQUIREMENTS:
+- Personality: {strategy.get('personality', 'helpful_assistant')}
+- Length: {strategy.get('length', 'medium')}            
+- Tone: {strategy.get('tone', 'friendly')}
+
+🎯 RESPONSE RULES:
+
+CORE PRINCIPLES:
+1. Start with value, not preamble. Jump directly into insights without any conversational setup.
+2. NEVER begin your response by restating, echoing, or mentioning what the user asked about. Go straight to the substantive information.
+3. NEVER announce tool usage ("Let me search...", "I found...")
+4. Match emotional energy PRECISELY using sentiment guide
+5. Be genuinely helpful and informative
+
+OPENING LINE RULES:
+- DO: Start with direct insights, facts, or analysis
+- DON'T: Reference the user's query topic in your first sentence
+- The user knows what they asked - deliver the answer immediately
+
+COMMUNICATION STYLE:
+- Clear and concise
+- Naturally incorporate data
+- Professional but friendly
+- Empathetic when appropriate
+- Direct and actionable
+
+CRITICAL DON'TS:
+❌ Repeat user's words
+❌ Corporate jargon
+❌ Unnecessary preamble
+❌ Forced responses
+            
+✅ DO: Be genuinely helpful, provide accurate information, use data naturally, match communication style, create value in every response
+
+USER QUERY: {original_query}
+
+{'WHATSAPP CONTEXT: You are communicating via WhatsApp where brevity is essential for mobile engagement. ' + ('This is a FOLLOW-UP query - user wants depth on previous discussion. Provide 350-450 character response with comprehensive insights, examples, and actionable details. Use the space fully.' if analysis.get('is_follow_up', False) else 'This is an INITIAL query - create engagement spark. Compress response to 200-250 characters maximum - deliver the most critical insight that invites further conversation. Platform constraints override data volume.') if source == 'whatsapp' else ''}
+
+NOW RESPOND as a helpful assistant. Be natural, informative, empathetic, and genuinely valuable."""
+
+        
+        max_tokens = {
+            "micro": 150,
+            "short": 300,
+            "medium": 500,
+            "detailed": 700
+        }.get(strategy.get('length', 'medium'), 500)
+        
+        # Override for transformative mode
+        if mode == 'transformative':
+            max_tokens = 4000
+    
+        language = detected_language.lower()
+        
+        logger.info(f" CALLING HEART LLM for streaming response generation...")
+        logger.info(f" Max tokens: {max_tokens}, Temperature: 0.4")
+        
+        messages = [{"role": "user", "content": response_prompt}]
+        
+        system_prompt = f"""User's current language: {detected_language}
+
+                    Respond ONLY in this language using the SAME alphabet/characters the user typed.
+                    If hinglish/romanized indian language → use Roman letters (a-z) like "mein", "hai", "kya"
+                    If hindi → use Devanagari (क, ख, ग)
+                    If english → use English only
+
+                    Answer based on the provided data."""
+        
+        try:
+            if language in SARVAM_SUPPORTED_LANGUAGES:
+                async for chunk in self.indic_llm.generate_stream(messages, temperature=0.4, 
+                                                                   max_tokens=max_tokens, system_prompt=system_prompt):
+                    yield chunk
+            else:
+                async for chunk in self.heart_llm.generate_stream(messages, temperature=0.4, 
+                                                                   max_tokens=max_tokens, system_prompt=system_prompt):
+                    yield chunk
+        except Exception as e:
+            logger.error(f"Streaming response generation failed: {e}")
+            yield "I apologize, but I had trouble generating a response. Could you please try again?"
+
+    async def process_query_streaming(self, query: str, chat_history: List[Dict] = None, 
+                                      user_id: str = None, mode: str = None, 
+                                      source: Optional[str] = None) -> AsyncGenerator[Dict[str, Any], None]:
+        """Process query with streaming response - yields events"""
+        self._start_worker_if_needed()
+        logger.info(f" STREAMING PROCESSING QUERY: '{query}'")
+        start_time = datetime.now()
+        
+        # Initialize variables that are used later in all code paths
+        cached_analysis = None
+        analysis = None
+        analysis_time = 0.0
+        detected_language = "english"
+        english_query = query
+        original_query = query
+        
+        try:
+            # Normalize source
+            source = (source or "").strip().lower()
+            if source not in ("whatsapp", "website"):
+                source = "whatsapp"
+            logger.info(f"Resolved source: {source}, mode: {mode}")
+
+            # Language Detection
+            if self.language_detection_enabled:
+                logger.info(f"🌍 LANGUAGE DETECTION LAYER: Processing query...")
+                lang_result = await self._detect_and_translate(query, chat_history)
+                detected_language = lang_result["detected_language"]
+                english_query = lang_result["english_translation"]
+                original_query = lang_result["original_query"]
+                logger.info(f"🌍 Language Detection Complete: {detected_language}")
+            
+            processing_query = english_query
+            
+            # Check cache or analyze
+            cached_analysis = await self.cache_manager.get_cached_query(processing_query, user_id)
+            
+            if cached_analysis:
+                logger.info(f"🎯 USING CACHED ANALYSIS - Skipping analysis LLM call")
+                analysis = cached_analysis
+                analysis_time = 0.0
+            else:
+                # Retrieve memories - DISABLED
+                # memory_results = await self.memory.search(processing_query[:100], user_id=user_id, limit=5)
+                # memories = "\n".join([f"- {item['memory']}" for item in memory_results.get("results", []) if item.get("memory")]) or "No previous context."
+                memories = "No previous context."
+                logger.info(f" Retrieved memories: {len(memories)} chars")
+                
+                analysis_start = datetime.now()
+                
+                # ROUTING LAYER
+                logger.info(f"🧭 ROUTING: Determining analysis path for {source} source...")
+                routing_decision = await self._route_query(processing_query, chat_history, memories)
+                
+                if routing_decision["needs_cot"]:
+                    if source == "whatsapp":
+                        logger.info(f"💰 COST PATH: COT WHATSAPP - Complex query")
+                        analysis = await self._simple_analysis(processing_query, chat_history, memories, use_cot=True)
+                    else:
+                        logger.info(f"💰 COST PATH: COMPREHENSIVE - Complex query")
+                        analysis = await self._comprehensive_analysis(processing_query, chat_history, memories)
+                else:
+                    logger.info(f"💰 COST PATH: SIMPLE ANALYSIS - Simple query")
+                    analysis = await self._simple_analysis(processing_query, chat_history, memories, use_cot=False)
+                
+                analysis_time = (datetime.now() - analysis_start).total_seconds()
+                logger.info(f" Analysis completed in {analysis_time:.2f}s")
+                
+                # Cache the analysis
+                await self.cache_manager.cache_query(processing_query, analysis, user_id, ttl=3600)
+            
+            # Log analysis results
+            tool_execution = analysis.get('tool_execution', {})
+            execution_mode = tool_execution.get('mode', 'parallel')
+            tools_to_use = analysis.get('tools_to_use', [])
+            logger.info(f" ANALYSIS RESULTS: Intent={analysis.get('semantic_intent', 'Unknown')}, Tools={tools_to_use}, Mode={execution_mode}")
+            
+            # Execute tools
+            tool_start = datetime.now()
+            tool_results = await self._execute_tools(tools_to_use, processing_query, analysis, user_id)
+            tool_time = (datetime.now() - tool_start).total_seconds()
+            logger.info(f" Tools executed in {tool_time:.2f}s")
+            
+            # Cache the tool results
+            if tool_results:
+                await self.cache_manager.cache_tool_results(query, tools_to_use, tool_results, user_id, ttl=3600)
+            
+            links = []
+            if tool_results:
+                links = [item.get("link") for item in tool_results.get("web_search_0", {}).get("results", [])]
+                logger.info(f" TOOL RESULTS: {len(tool_results)} tools returned data")
+            else:
+                logger.info(f" NO TOOLS EXECUTED - Conversational response only")
+            
+            # Get memories for response generation if not cached
+            if not cached_analysis:
+                # memory_results = await self.memory.search(processing_query, user_id=user_id, limit=5)
+                # memories = "\n".join([f"- {item['memory']}" for item in memory_results.get("results", []) if item.get("memory")]) or "No previous context."
+                memories = "No previous context."
+            else:
+                memories = "No previous context."
+            
+            # Stream response - ONLY send content chunks
+            response_start = datetime.now()
+            full_response = ""
+            
+            async for chunk in self._generate_response_streaming(
+                processing_query, analysis, tool_results, chat_history,
+                memories=memories, mode=mode, source=source,
+                detected_language=detected_language, original_query=original_query
+            ):
+                full_response += chunk
+                yield {"type": "chunk", "content": chunk}
+            
+            response_time = (datetime.now() - response_start).total_seconds()
+            total_time = (datetime.now() - start_time).total_seconds()
+            
+            # Queue memory task - DISABLED
+            # await self.task_queue.put(
+            #     AddBackgroundTask(
+            #         func=partial(self.memory.add),
+            #         params=([{"role": "user", "content": original_query}, {"role": "assistant", "content": full_response}], user_id),
+            #     )
+            # )
+            
+            formatted_links = "\nSources:\n\n >" + "\n > ".join(links[:3]) if links else ""
+            
+            logger.info(f" TOTAL STREAMING TIME: {total_time:.2f}s")
+            
+            # Yield done event - minimal info
+            if formatted_links:
+                yield {"type": "done", "sources": formatted_links}
+            
+        except Exception as e:
+            logger.error(f" Streaming processing failed: {str(e)}")
+            yield {"type": "error", "message": str(e)}

@@ -7,7 +7,7 @@ import asyncio
 import aiohttp
 import json
 import logging
-from typing import Dict, List, Any, Optional
+from typing import Dict, List, Any, Optional, AsyncGenerator
 
 logger = logging.getLogger(__name__)
 
@@ -292,3 +292,149 @@ class LLMClient:
             "model": self.config.model,
             "max_tokens": str(self.config.max_tokens)
         }
+    
+    async def generate_stream(self, messages: List[Dict[str, str]], 
+                              temperature: float,
+                              system_prompt: Optional[str] = None,
+                              max_tokens: Optional[int] = None) -> AsyncGenerator[str, None]:
+        """Generate streaming response - yields text chunks"""
+        
+        logger.info(f"🤖 Streaming API call: {self.config.provider}/{self.config.model}")
+        
+        if not self.session:
+            await self.start_session()
+        
+        tokens = max_tokens if max_tokens is not None else self.config.max_tokens
+        
+        if system_prompt:
+            messages = [{"role": "system", "content": system_prompt}] + messages
+        
+        try:
+            if self.config.provider in ['openai', 'openrouter', 'groq']:
+                async for chunk in self._openai_compatible_stream(messages, temperature, tokens):
+                    yield chunk
+            elif self.config.provider == 'sarvam':
+                async for chunk in self._sarvam_stream(messages, temperature, tokens):
+                    yield chunk
+            else:
+                # Fallback: use non-streaming and yield complete response
+                logger.warning(f"Streaming not supported for {self.config.provider}, falling back to non-streaming")
+                response = await self.generate(messages, temperature, system_prompt=None, max_tokens=tokens)
+                yield response
+        except Exception as e:
+            logger.error(f"❌ 🤖 Streaming failed: {type(e).__name__}: {str(e)}")
+            raise
+    
+    async def _openai_compatible_stream(self, messages: List[Dict[str, str]], 
+                                        temperature: float, max_tokens: int) -> AsyncGenerator[str, None]:
+        """Handle OpenAI-compatible streaming API requests"""
+        
+        headers = {
+            "Authorization": f"Bearer {self.config.api_key}",
+            "Content-Type": "application/json"
+        }
+        
+        if self.config.provider == 'openrouter':
+            headers["HTTP-Referer"] = "https://github.com/brain-heart-research"
+            headers["X-Title"] = "Brain-Heart Research System"
+        
+        payload = {
+            "model": self.config.model,
+            "messages": messages,
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+            "stream": True
+        }
+        
+        if self.config.provider == 'openrouter':
+            payload["provider"] = {"sort": "throughput"}
+        
+        if hasattr(self.config, 'base_url') and self.config.base_url:
+            url = f"{self.config.base_url}/chat/completions"
+        else:
+            url = "https://api.openai.com/v1/chat/completions"
+        
+        async with self.session.post(url, headers=headers, json=payload) as response:
+            if response.status != 200:
+                error_text = await response.text()
+                logger.error(f"❌ 🤖 {self.config.provider} streaming error: {response.status}: {error_text}")
+                raise Exception(f"API error {response.status}: {error_text}")
+            
+            # Use iter_any() for truly unbuffered streaming - same as Sarvam
+            buffer = ""
+            async for chunk_bytes in response.content.iter_any():
+                buffer += chunk_bytes.decode('utf-8')
+                
+                # Process complete lines
+                while '\n' in buffer:
+                    line, buffer = buffer.split('\n', 1)
+                    line = line.strip()
+                    
+                    if not line or not line.startswith('data:'):
+                        continue
+                    
+                    data = line[5:].strip()
+                    if data == '[DONE]':
+                        return
+                    
+                    try:
+                        chunk_json = json.loads(data)
+                        content = chunk_json.get('choices', [{}])[0].get('delta', {}).get('content', '')
+                        if content:
+                            # Debug: Log what we receive from API
+                            logger.debug(f"🔍 {self.config.provider} API chunk ({len(content)} chars): '{content[:50]}{'...' if len(content) > 50 else ''}'")
+                            yield content
+                    except json.JSONDecodeError:
+                        continue
+    
+    async def _sarvam_stream(self, messages: List[Dict[str, str]], 
+                             temperature: float, max_tokens: int) -> AsyncGenerator[str, None]:
+        """Handle Sarvam streaming API requests"""
+        
+        url = "https://api.sarvam.ai/v1/chat/completions"
+        headers = {
+            "api-subscription-key": self.config.api_key,
+            "Content-Type": "application/json"
+        }
+        
+        payload = {
+            "model": self.config.model,
+            "messages": messages,
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+            "stream": True
+        }
+        
+        async with aiohttp.ClientSession() as session:
+            async with session.post(url, headers=headers, json=payload) as response:
+                if response.status != 200:
+                    error_text = await response.text()
+                    logger.error(f"❌ 🤖 Sarvam streaming error: {response.status}: {error_text}")
+                    raise Exception(f"API error {response.status}: {error_text}")
+                
+                # Use iter_any() for truly unbuffered streaming
+                buffer = ""
+                async for chunk_bytes in response.content.iter_any():
+                    buffer += chunk_bytes.decode('utf-8')
+                    
+                    # Process complete lines
+                    while '\n' in buffer:
+                        line, buffer = buffer.split('\n', 1)
+                        line = line.strip()
+                        
+                        if not line or not line.startswith('data:'):
+                            continue
+                        
+                        data = line[5:].strip()
+                        if data == '[DONE]':
+                            return
+                        
+                        try:
+                            chunk_json = json.loads(data)
+                            content = chunk_json.get('choices', [{}])[0].get('delta', {}).get('content', '')
+                            if content:
+                                # Debug: Log what we receive from API
+                                logger.debug(f"🔍 Sarvam API chunk ({len(content)} chars): '{content[:50]}{'...' if len(content) > 50 else ''}'")
+                                yield content
+                        except json.JSONDecodeError:
+                            continue

@@ -1,11 +1,12 @@
 from fastapi import FastAPI, APIRouter, UploadFile, File, Form, Depends, Body
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi_limiter import FastAPILimiter
 from fastapi_limiter.depends import RateLimiter
 from redis.asyncio import Redis
 from contextlib import asynccontextmanager
 from core.scraping import scrape_multiple_websites, crawl
 from urllib.parse import urlparse
+import json as json_module
 
 
 # Updated imports for new knowledge base manager
@@ -365,7 +366,7 @@ async def chat_brain_heart_system(request: ChatMessage = Body(...)):
     try:
         user_id = request.userid
         user_query = request.user_query
-        chat_history = request.chat_history[-4:] if hasattr(request, 'chat_history') and request.chat_history else []
+        chat_history = request.chat_history[-10:] if hasattr(request, 'chat_history') and request.chat_history else []
         mode = request.mode if hasattr(request, 'mode') else None
         source = request.source if hasattr(request, 'source') else 'whatsapp'
         
@@ -389,6 +390,34 @@ async def chat_brain_heart_system(request: ChatMessage = Body(...)):
             content={"error": f"Brain-Heart processing failed: {str(e)}"}, 
             status_code=500
         )
+
+
+@router.post("/chat/stream", dependencies=[Depends(RateLimiter(times=6, seconds=60))])
+async def chat_stream(request: ChatMessage = Body(...)):
+    """Streaming chat endpoint - uses OptimizedAgent with SSE"""
+    
+    async def event_generator():
+        try:
+            user_id = request.userid
+            user_query = request.user_query
+            chat_history = request.chat_history[-10:] if hasattr(request, 'chat_history') and request.chat_history else []
+            mode = request.mode if hasattr(request, 'mode') else None
+            source = request.source if hasattr(request, 'source') else 'whatsapp'
+            
+            safe_log_user_data(user_id, 'streaming_chat', message_count=len(user_query))
+            
+            async for event in agent.process_query_streaming(user_query, chat_history, user_id, mode, source):
+                yield f"data: {json_module.dumps(event)}\n\n"
+                
+        except Exception as e:
+            logging.error(f"❌ Streaming chat failed: {str(e)}")
+            yield f"data: {json_module.dumps({'type': 'error', 'message': str(e)})}\n\n"
+    
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "Connection": "keep-alive"}
+    )
 
 
 # ============================================================================
