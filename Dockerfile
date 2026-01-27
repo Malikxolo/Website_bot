@@ -2,11 +2,18 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+# Install uv
+RUN pip install uv
+
+# Copy dependency files
+COPY pyproject.toml .
+COPY uv.lock* .
+
+# Install dependencies with uv
+RUN uv sync --frozen --no-dev
 
 COPY . .
 
-EXPOSE 8501
+EXPOSE 8020
 
-CMD ["streamlit", "run", "app.py", "--server.port=8501", "--server.address=0.0.0.0"]
+CMD ["uv", "run", "main.py"]
