@@ -131,7 +131,7 @@ class OptimizedAgent:
         logger.info(f"TOOLS PROMPT SECTION: Final prompt built - length: {len(base_tools)} chars")
         return base_tools
     
-    async def process_query(self, query: str, chat_history: List[Dict] = None, user_id: str = None, mode: str = None, source: Optional[str] = None) -> Dict[str, Any]:
+    async def process_query(self, query: str, chat_history: List[Dict] = None, user_id: str = None, mode: str = None, source: Optional[str] = None, businessId: str = None, email: str = None, collection_ids: List[str] = None) -> Dict[str, Any]:
         """Process query with minimal LLM calls and Redis caching"""
         self._start_worker_if_needed()
         logger.info(f" PROCESSING QUERY: '{query}'")
@@ -267,9 +267,12 @@ class OptimizedAgent:
             tool_start = datetime.now()
             tool_results = await self._execute_tools(
                 tools_to_use,
-                processing_query,  # Use English query for tools
+                processing_query,
                 analysis,
-                user_id
+                user_id,
+                businessId=businessId,
+                email=email,
+                collection_ids=collection_ids
             )
             tool_time = (datetime.now() - tool_start).total_seconds()
             logger.info(f" Tools executed in {tool_time:.2f}s")
@@ -1082,7 +1085,7 @@ Think through each question naturally, then return ONLY the JSON. No other text.
             logging.error(f"Response snippet: {response[:500] if response else 'No response'}")
             return self._get_fallback_analysis(query)
  
-    async def _execute_tools(self, tools: List[str], query: str, analysis: Dict, user_id: str = None) -> Dict[str, Any]:
+    async def _execute_tools(self, tools: List[str], query: str, analysis: Dict, user_id: str = None, **kwargs) -> Dict[str, Any]:
         """Execute tools with smart parallel/sequential handling based on dependencies"""
         
         if not tools:
@@ -1095,12 +1098,12 @@ Think through each question naturally, then return ONLY the JSON. No other text.
         # Route to appropriate execution method
         if execution_mode == 'sequential' and len(tools) > 1:
             logger.info(f" SEQUENTIAL EXECUTION MODE")
-            return await self._execute_sequential(tools, query, analysis, user_id)
+            return await self._execute_sequential(tools, query, analysis, user_id, **kwargs)
         else:
             logger.info(f" PARALLEL EXECUTION MODE")
-            return await self._execute_parallel(tools, query, analysis, user_id)
+            return await self._execute_parallel(tools, query, analysis, user_id, **kwargs)
     
-    async def _execute_parallel(self, tools: List[str], query: str, analysis: Dict, user_id: str = None) -> Dict[str, Any]:
+    async def _execute_parallel(self, tools: List[str], query: str, analysis: Dict, user_id: str = None, **kwargs) -> Dict[str, Any]:
         """Execute tools in parallel (handles duplicate tool names)"""
         results = {}
         enhanced_queries = analysis.get('enhanced_queries', {})
@@ -1149,10 +1152,15 @@ Think through each question naturally, then return ONLY the JSON. No other text.
                 # Always use indexed key format for consistency
                 result_key = indexed_key
                 
-                # Build kwargs with scraping params if applicable
                 tool_kwargs = {"query": tool_query, "user_id": user_id}
                 if scrape_count is not None:
                     tool_kwargs["scrape_top"] = scrape_count
+
+                # Add tenant context for RAG tool
+                if tool == 'rag':
+                    tool_kwargs["businessId"] = kwargs.get("businessId")
+                    tool_kwargs["email"] = kwargs.get("email")
+                    tool_kwargs["collection_ids"] = kwargs.get("collection_ids", [])
                 
                 task = self.tool_manager.execute_tool(tool, **tool_kwargs)
                 tasks.append((result_key, task))
@@ -1170,7 +1178,7 @@ Think through each question naturally, then return ONLY the JSON. No other text.
         
         return results
     
-    async def _execute_sequential(self, tools: List[str], query: str, analysis: Dict, user_id: str = None) -> Dict[str, Any]:
+    async def _execute_sequential(self, tools: List[str], query: str, analysis: Dict, user_id: str = None, **kwargs) -> Dict[str, Any]:
         """Execute tools sequentially with middleware for dependent queries"""
         results = {}
         enhanced_queries = analysis.get('enhanced_queries', {})
@@ -1192,6 +1200,10 @@ Think through each question naturally, then return ONLY the JSON. No other text.
         first_tool_kwargs = {"query": first_query, "user_id": user_id}
         if first_tool_name == 'web_search':
             first_tool_kwargs["scrape_top"] = 3
+        if first_tool_name == 'rag':
+            first_tool_kwargs["businessId"] = kwargs.get("businessId")
+            first_tool_kwargs["email"] = kwargs.get("email")
+            first_tool_kwargs["collection_ids"] = kwargs.get("collection_ids", [])
         
         try:
             results[first_tool_key] = await self.tool_manager.execute_tool(first_tool_name, **first_tool_kwargs)
@@ -1223,6 +1235,10 @@ Think through each question naturally, then return ONLY the JSON. No other text.
             current_tool_kwargs = {"query": enhanced_query, "user_id": user_id}
             if current_tool_name == 'web_search':
                 current_tool_kwargs["scrape_top"] = 3
+            if current_tool_name == 'rag':
+                current_tool_kwargs["businessId"] = kwargs.get("businessId")
+                current_tool_kwargs["email"] = kwargs.get("email")
+                current_tool_kwargs["collection_ids"] = kwargs.get("collection_ids", [])
             
             try:
                 results[current_tool_key] = await self.tool_manager.execute_tool(current_tool_name, **current_tool_kwargs)
@@ -2199,8 +2215,9 @@ NOW RESPOND as a helpful assistant. Be natural, informative, empathetic, and gen
             yield "I apologize, but I had trouble generating a response. Could you please try again?"
 
     async def process_query_streaming(self, query: str, chat_history: List[Dict] = None, 
-                                      user_id: str = None, mode: str = None, 
-                                      source: Optional[str] = None) -> AsyncGenerator[Dict[str, Any], None]:
+                                  user_id: str = None, mode: str = None, 
+                                  source: Optional[str] = None, businessId: str = None,
+                                  email: str = None, collection_ids: List[str] = None) -> AsyncGenerator[Dict[str, Any], None]:
         """Process query with streaming response - yields events"""
         self._start_worker_if_needed()
         logger.info(f" STREAMING PROCESSING QUERY: '{query}'")
@@ -2277,7 +2294,15 @@ NOW RESPOND as a helpful assistant. Be natural, informative, empathetic, and gen
             
             # Execute tools
             tool_start = datetime.now()
-            tool_results = await self._execute_tools(tools_to_use, processing_query, analysis, user_id)
+            tool_results = await self._execute_tools(
+                tools_to_use, 
+                processing_query, 
+                analysis, 
+                user_id,
+                businessId=businessId,
+                email=email,
+                collection_ids=collection_ids
+            )
             tool_time = (datetime.now() - tool_start).total_seconds()
             logger.info(f" Tools executed in {tool_time:.2f}s")
             

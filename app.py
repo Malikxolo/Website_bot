@@ -88,7 +88,10 @@ async def mog_query(user_id: str, chat_history:List, query: str, source: str = "
         "userid": user_id,
         "chat_history": chat_history,
         "user_query": query,
-        "source": source
+        "source": source,
+        "businessId": "foodn-8b4c78",
+        "email": "aakashisjesus@gmail.com",
+        "collection_ids": ["69490fbb-ab43-43ef-a0c7-f54a9e4bfd99"]
     }
 
     async with aiohttp.ClientSession() as session:

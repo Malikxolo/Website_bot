@@ -312,6 +312,9 @@ class ChatMessage(BaseModel):
     user_query: str
     mode: Optional[str] = None
     source: Optional[str] = 'whatsapp'
+    businessId: Optional[str] = None
+    email: Optional[str] = None
+    collection_ids: Optional[List[str]] = None
     
 from .global_config import settings
 
@@ -369,11 +372,14 @@ async def chat_brain_heart_system(request: ChatMessage = Body(...)):
         chat_history = request.chat_history[-10:] if hasattr(request, 'chat_history') and request.chat_history else []
         mode = request.mode if hasattr(request, 'mode') else None
         source = request.source if hasattr(request, 'source') else 'whatsapp'
+        businessId = request.businessId if hasattr(request, 'businessId') else None
+        email = request.email if hasattr(request, 'email') else None
+        collection_ids = request.collection_ids if hasattr(request, 'collection_ids') else None
         
         safe_log_user_data(user_id, 'brain_heart_chat', message_count=len(user_query))
         
         
-        result = await agent.process_query(user_query, chat_history, user_id, mode, source)
+        result = await agent.process_query(user_query, chat_history, user_id, mode, source, businessId, email, collection_ids)
         
         if result["success"]:
             safe_log_response(result, level='info')
@@ -403,10 +409,13 @@ async def chat_stream(request: ChatMessage = Body(...)):
             chat_history = request.chat_history[-10:] if hasattr(request, 'chat_history') and request.chat_history else []
             mode = request.mode if hasattr(request, 'mode') else None
             source = request.source if hasattr(request, 'source') else 'whatsapp'
+            businessId = request.businessId if hasattr(request, 'businessId') else None
+            email = request.email if hasattr(request, 'email') else None
+            collection_ids = request.collection_ids if hasattr(request, 'collection_ids') else None
             
             safe_log_user_data(user_id, 'streaming_chat', message_count=len(user_query))
             
-            async for event in agent.process_query_streaming(user_query, chat_history, user_id, mode, source):
+            async for event in agent.process_query_streaming(user_query, chat_history, user_id, mode, source, businessId, email, collection_ids):
                 yield f"data: {json_module.dumps(event)}\n\n"
                 
         except Exception as e:

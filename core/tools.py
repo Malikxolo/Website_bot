@@ -841,7 +841,7 @@ class RAGTool(BaseTool):
         logger.info("RAGTool initialized")
     
     async def execute(self, query: str, user_id: str = None, **kwargs) -> Dict[str, Any]:
-        """Execute RAG query on user's vector database"""
+        """Execute RAG query on user's vector database via REST API"""
         self._record_usage()
         logger.info(f"RAG query started: user_id={user_id}, query='{query[:50]}...'")
         
@@ -854,94 +854,100 @@ class RAGTool(BaseTool):
                     "query": query
                 }
             
+            # Get user context
+            logger.debug(f"Fetching user context for: {user_id}")
             
-            logger.debug(f"Checking collections for user: {user_id}")
-            org_id = await get_org_cache(user_id)
-            if not org_id:
-                org_id = "org_global"
-            collection_name = await get_collection_cache(user_id)
-            if not collection_name:
-                collection_name = "global_collection"
-                user_id = "system"
-
-            # Query the user's collection
-            result = await query_documents(org_id, collection_name, query, user_id, n_results=5)
+                
             
-            if result["success"]:
-                chunks_count = len(result["results"])
-                distances = result.get("distances", [])
-                
-                # Log success with detailed metrics
-                logger.info(f" RAG query SUCCESS for user {user_id}")
-                logger.info(f"   Collection: {collection_name}")
-                logger.info(f"   Retrieved chunks: {chunks_count}")
-                logger.info(f"   Query: '{query[:50]}...'")
-                
-                # Log distances for relevance analysis
-                if distances:
-                    avg_distance = sum(distances) / len(distances)
-                    min_distance = min(distances)
-                    max_distance = max(distances)
-                    
-                    logger.info(f"   Distance metrics - Min: {min_distance:.4f}, Max: {max_distance:.4f}, Avg: {avg_distance:.4f}")
-                    logger.debug(f"   All distances: {distances}")
-                    
-                    # Log quality assessment
-                    if avg_distance < 0.3:
-                        logger.info("   Quality: HIGH relevance (avg distance < 0.3)")
-                    elif avg_distance < 0.6:
-                        logger.info("   Quality: MEDIUM relevance (avg distance < 0.6)")
-                    else:
-                        logger.warning("   Quality: LOW relevance (avg distance >= 0.6)")
-                else:
-                    logger.warning("   No distance information available")
-                
-                # Log first chunk preview for debugging
-                documents = []
-                if result["results"]:
-                    documents = [r["document"] for r in result["results"] if isinstance(r, dict) and "document" in r]
-                    first_chunk = documents[0][:200] + ("..." if len(documents[0]) > 200 else "")   
-                    logger.info(f"   First chunk preview: '{first_chunk}'")
-                    logger.info(f"   Total retrieved documents: {len(documents)}")
-                
-                return {
-                    "success": True,
-                    "retrieved": "\n\n".join(documents),
-                    "chunks": result["results"],
-                    "query": query,
-                    "chunks_count": chunks_count,
-                    "collection": collection_name,
-                    "distances": distances,
-                    "avg_distance": avg_distance if distances else None
-                }
-            else:
-                logger.error(f"❌ RAG query FAILED for user {user_id}")
-                logger.error(f"   Collection: {collection_name}")
-                logger.error(f"   Error: {result.get('error', 'Unknown error')}")
-                logger.error(f"   Query: '{query[:50]}...'")
-                
+            if not kwargs.get('businessId') or not kwargs.get('email'):
+                logger.error(f"Missing tenant context for user {user_id}")
                 return {
                     "success": False,
-                    "error": result["error"],
+                    "error": "Tenant context not found for user",
                     "query": query
                 }
-                
+            
+            collection_ids = kwargs.get('collection_ids', [])
+            
+            
+            headers = {
+                "Content-Type": "application/json",
+                "X-Gateway-Service-Key": os.getenv("RAG_API_KEY"),
+                "X-Auth-Tenant-Slug": kwargs.get('businessId'),
+                "X-Auth-User-Email": kwargs.get('email')
+            }
+            
+            payload = {
+                "query": query,
+                "collection_ids": collection_ids,
+                "top_k": kwargs.get("top_k", 5),
+                "similarity_threshold": kwargs.get("similarity_threshold", 0.7),
+                "use_hybrid": kwargs.get("use_hybrid", True)
+            }
+            
+            logger.debug(f"RAG API request: collection_ids={collection_ids}, top_k={payload['top_k']}")
+            
+            # Make API call
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    f"{os.getenv('RAG_API_BASE_URL')}/api/v1/query/retrieve",
+                    headers=headers,
+                    json=payload,
+                    timeout=aiohttp.ClientTimeout(total=30)
+                ) as response:
+                    response_data = await response.json()
+                    
+                    if response.status != 200:
+                        logger.error(f"❌ RAG API returned {response.status}: {response_data}")
+                        return {
+                            "success": False,
+                            "error": response_data.get("detail", f"API error: {response.status}"),
+                            "query": query
+                        }
+            
+            # Parse successful response
+            results = response_data.get("results", [])
+            chunks_count = len(results)
+            
+            # Extract documents and distances
+            documents = [r.get("content", r.get("document", "")) for r in results]
+            distances = [r.get("distance", r.get("score", 0)) for r in results]
+            
+            logger.info(f"✅ RAG query SUCCESS for user {user_id}")
+            logger.info(f"   Collections: {collection_ids}")
+            logger.info(f"   Retrieved chunks: {chunks_count}")
+            logger.info(f"   Query: '{query[:50]}...'")
+            
+            # Log first chunk preview
+            if documents:
+                first_chunk = documents[0][:200] + ("..." if len(documents[0]) > 200 else "")
+                logger.info(f"   First chunk preview: '{first_chunk}'")
+                logger.info(f"   Total retrieved documents: {len(documents)}")
+            
+            return {
+                "success": True,
+                "retrieved": "\n\n".join(documents),
+                "chunks": results,
+                "query": query,
+                "chunks_count": chunks_count,
+                "collection_ids": collection_ids
+            }
+                    
+        except aiohttp.ClientError as e:
+            logger.error(f"❌ RAG API connection error for user {user_id}: {str(e)}")
+            return {
+                "success": False,
+                "error": f"RAG service connection failed: {str(e)}",
+                "query": query
+            }
         except Exception as e:
             logger.error(f"❌ RAG query EXCEPTION for user {user_id}")
             logger.error(f"   Exception: {str(e)}")
             logger.error(f"   Query: '{query[:50]}...'")
             
-            # Log full traceback for debugging
             import traceback
             logger.error(f"   Traceback: {traceback.format_exc()}")
             
-            return {
-                "success": False,
-                "error": f"RAG query failed: {str(e)}",
-                "query": query
-            }
-                
-        except Exception as e:
             return {
                 "success": False,
                 "error": f"RAG query failed: {str(e)}",
@@ -1693,3 +1699,13 @@ class ToolManager:
                 logger.warning(f"   ⚠️ Error closing QueryAgent: {str(e)}")
         
         logger.info("  Tool cleanup complete")
+        
+
+if __name__ == "__main__":
+    tool = ToolManager({}, None)
+    import asyncio
+    async def main():
+        res = await tool.execute_tool("rag",query="What is given in the uploaded document?", user_id="user123", businessId="foodn-8b4c78", email="aakashisjesus@gmail.com", collection_ids=["69490fbb-ab43-43ef-a0c7-f54a9e4bfd99"])
+        print(res)
+    
+    asyncio.run(main())
